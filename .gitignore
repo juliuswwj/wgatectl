@@ -1,0 +1,15 @@
+# Build artifacts
+*.o
+*.d
+*.a
+
+# Compiled binary
+/wgatectl
+
+# Reference / third-party material (not part of this project)
+/ref/
+
+# Editor / OS
+*.swp
+*~
+.DS_Store

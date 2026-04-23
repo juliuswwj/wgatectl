@@ -1,0 +1,48 @@
+# /etc/wgatectl.conf — settings for the wgatectl daemon
+#
+# Values here are overridden by matching environment variables on the
+# service.  Every key is optional; defaults shown here match the compiled-in
+# defaults.
+
+# The LAN-facing interface to capture on.
+WG_IFACE=eth1
+
+# The LAN subnet.  Only packets whose source or destination falls inside
+# this subnet are considered.
+WG_NETWORK=10.6.6.0/24
+
+# Last-octet window used to limit per-client tracking to "real" device IPs
+# (skips the gateway, broadcast, DHCP range boundaries, ...).  Defaults
+# mirror rtset.py's behaviour.
+WG_HOST_OCTET_LO=64
+WG_HOST_OCTET_HI=240
+
+# Paths to the dnsmasq state files.
+WG_DNSMASQ_CONF=/etc/dnsmasq.conf
+WG_DNSMASQ_LEASES=/var/lib/misc/dnsmasq.leases
+
+# Block-list persistence (a JSON array of IP or name strings).
+WG_BLOCKS_JSON=/opt/wgatectl/blocks.json
+
+# Where the per-minute JSONL events go.  Files are named events-YYYYMMDD.jsonl.
+# The daemon creates this directory if it doesn't exist.
+WG_JSONL_DIR=/opt/wgatectl
+WG_JSONL_RETAIN=14
+
+# Unix-socket control plane.  Lives alongside the JSONL files on persistent
+# storage.  Mode is forced to 0660; if WG_SOCK_GROUP names an existing group
+# the socket is chowned to root:<group>.
+WG_SOCK=/opt/wgatectl/wgatectl.sock
+WG_SOCK_GROUP=wgate
+
+# External binaries (absolute paths so the daemon works under a strict
+# systemd sandbox).
+WG_IPTABLES_BIN=/sbin/iptables
+WG_IPSET_BIN=/sbin/ipset
+
+# Metrics flush cadence.  The main tick fires every second; this knob
+# controls the JSONL flush period and iptables self-heal reconcile.
+WG_FLUSH_SECONDS=60
+
+# Development overrides — leave unset in production.
+# WG_DEBUG=1
