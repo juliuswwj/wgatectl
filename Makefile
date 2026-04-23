@@ -95,9 +95,6 @@ install: $(BIN)
 	install -m 0755 $(BIN) $(DESTDIR)$(SBINDIR)/$(BIN)
 	install -d $(DESTDIR)$(UNITDIR)
 	install -m 0644 systemd/wgatectl.service $(DESTDIR)$(UNITDIR)/wgatectl.service
-	install -d $(DESTDIR)$(SYSCONFDIR)
-	install -m 0644 examples/wgatectl.conf.example $(DESTDIR)$(SYSCONFDIR)/wgatectl.conf.example
-	install -d $(DESTDIR)/opt/wgatectl
 ifeq ($(DESTDIR),)
 	systemctl daemon-reload
 	systemctl restart wgatectl

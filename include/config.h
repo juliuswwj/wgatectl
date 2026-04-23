@@ -10,8 +10,6 @@ typedef struct {
     char     network_cidr[32];  /* 10.6.6.0/24 */
     uint32_t net_addr;          /* host-order */
     uint32_t net_mask;
-    int      host_octet_lo;     /* inclusive, default 64 */
-    int      host_octet_hi;     /* exclusive, default 240 */
 
     /* Static-assignment zone: CIDR (e.g. "10.6.6.0/27") that the gateway
      * exempts from all FORWARD filtering and proactively ARP-binds.  When
@@ -41,6 +39,15 @@ typedef struct {
     char     ip_bin         [96];   /* /sbin/ip  (iproute2) */
 
     int      flush_seconds;         /* default 60 */
+
+    /* Supervisor tuning. threshold_min / cooldown_min are minutes;
+     * min_bytes_per_min is the minimum aggregate matched-domain traffic
+     * per minute (summed across all matched targets) that counts as
+     * "active" for that minute — keepalives/background heartbeats stay
+     * under this and don't accrue toward the trigger. */
+    int      supervised_threshold_min;
+    int      supervised_cooldown_min;
+    int      supervised_min_bytes_per_min;
 } wg_cfg_t;
 
 /* Populate cfg with compile-time defaults, overlay /etc/wgatectl.conf (if

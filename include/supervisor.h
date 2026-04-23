@@ -11,16 +11,23 @@
 #include <stdint.h>
 
 /* The supervisor watches per-client per-minute traffic: if a device's
- * traffic includes any domain listed in supervised.json for 5 consecutive
- * minutes, the device is fully blocked for 1 hour. After the cool-down the
- * counter is reset. Detection only runs while the dhcp-range mode is
- * `supervised`; the caller controls that. */
+ * traffic includes any domain listed in supervised.json for N consecutive
+ * minutes (WG_SUPERVISED_THRESHOLD_MIN, default 5), the device is fully
+ * blocked for M minutes (WG_SUPERVISED_COOLDOWN_MIN, default 60). After
+ * the cool-down the counter is reset. Detection only runs while the
+ * dhcp-range mode is `supervised`; the caller controls that. */
 
 typedef struct wg_supervisor wg_supervisor_t;
 
 wg_supervisor_t *supervisor_new(const char *supervised_path,
                                 const char *triggers_path);
 void             supervisor_free(wg_supervisor_t *s);
+
+/* Override the built-in defaults. Values <= 0 are ignored for the two
+ * minute fields; min_bytes_per_min accepts 0 (= any packet counts). */
+void             supervisor_configure(wg_supervisor_t *s,
+                                      int threshold_min, int cooldown_min,
+                                      int min_bytes_per_min);
 
 int  supervisor_load(wg_supervisor_t *s);
 int  supervisor_save(wg_supervisor_t *s);
@@ -31,10 +38,13 @@ int  supervisor_save(wg_supervisor_t *s);
  * match `example.com`. */
 bool supervisor_domain_matches(const wg_supervisor_t *s, const char *domain);
 
-/* Per-minute observation. Called once per (client_ip, domain) bucket from
- * the minute flush, BEFORE the metrics aggregator is reset. */
+/* Per-minute observation. Called once per (client_ip, domain) bucket
+ * from the minute flush, BEFORE the metrics aggregator is reset. The
+ * bucket's byte total is accumulated across all matched targets for
+ * the client; the minute only counts toward the consecutive-trigger
+ * if the accumulated bytes cross the configured min_bytes_per_min. */
 void supervisor_observe(wg_supervisor_t *s, uint32_t client_ip,
-                        const char *domain);
+                        const char *domain, uint64_t bytes);
 
 /* Close out the minute: increment counters for clients that matched at
  * least once, reset counters for tracked clients that didn't match, and

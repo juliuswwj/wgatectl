@@ -36,7 +36,10 @@ bool wg_block_set_has (const wg_block_set_t *b, uint32_t ip);
  *     3. -s <static_cidr> -j ACCEPT                   (if static_cidr != NULL/"")
  *     4. -s <ip>/32 -j DROP  (for each ip in `desired_drops`, sorted)
  *     5. -i <lan> -j DROP                             (if closed_mode)
- *     6. -j ACCEPT                                    (catch-all)
+ *
+ *   No trailing catch-all ACCEPT: FORWARD's default policy is ACCEPT,
+ *   so anything that survives our block is already permitted; adding
+ *   an explicit ACCEPT would mask admin-added DROPs below.
  *
  *   Any previously-installed wgatectl rule (or legacy rule from before
  *   the comment tag existed) is removed before the fresh block is

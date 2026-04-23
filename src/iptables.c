@@ -296,12 +296,10 @@ int iptables_reconcile(wg_iptables_t *t,
         const char *r5[] = { "-i", lan_iface, "-j", "DROP" };
         append_tagged(bin, r5, sizeof(r5)/sizeof(*r5), &na);
     }
-
-    /* rule 6: catch-all ACCEPT */
-    {
-        const char *r6[] = { "-j", "ACCEPT" };
-        append_tagged(bin, r6, sizeof(r6)/sizeof(*r6), &na);
-    }
+    /* No trailing catch-all ACCEPT: FORWARD's policy is ACCEPT by
+     * default, so anything that falls off the end is already allowed.
+     * Appending one would short-circuit admin-added DROP rules placed
+     * after ours. */
 
     if (added)   *added   = na;
     if (removed) *removed = nr;

@@ -103,9 +103,9 @@ static int ep_add(int epfd, int fd, uint32_t events, void *ptr) {
 
 static void sup_observe_cb(uint32_t client_ip, const char *domain,
                            uint64_t bytes, uint32_t pkts, void *arg) {
-    (void)bytes; (void)pkts;
+    (void)pkts;
     wg_state_t *st = arg;
-    supervisor_observe(st->sup, client_ip, domain);
+    supervisor_observe(st->sup, client_ip, domain, bytes);
 }
 
 /* Actually run iptables reconcile. Called either directly from code paths
@@ -233,6 +233,10 @@ static int init_all(wg_state_t *st, const char *conf_override) {
 
     st->sup = supervisor_new(st->cfg.supervised_json, st->cfg.triggers_json);
     if (!st->sup) return -1;
+    supervisor_configure(st->sup,
+                         st->cfg.supervised_threshold_min,
+                         st->cfg.supervised_cooldown_min,
+                         st->cfg.supervised_min_bytes_per_min);
     supervisor_load(st->sup);
 
     strncpy(st->ipt.iptables_bin, st->cfg.iptables_bin,
@@ -250,13 +254,11 @@ static int init_all(wg_state_t *st, const char *conf_override) {
     if (!st->metrics) return -1;
 
     wg_sniffer_cfg_t scfg = {
-        .iface         = st->cfg.iface,
-        .net_addr      = st->cfg.net_addr,
-        .net_mask      = st->cfg.net_mask,
-        .host_octet_lo = st->cfg.host_octet_lo,
-        .host_octet_hi = st->cfg.host_octet_hi,
-        .ipset         = st->ipset,
-        .metrics       = st->metrics
+        .iface    = st->cfg.iface,
+        .net_addr = st->cfg.net_addr,
+        .net_mask = st->cfg.net_mask,
+        .ipset    = st->ipset,
+        .metrics  = st->metrics
     };
     st->sniffer = sniffer_open(&scfg);
     if (!st->sniffer) return -1;

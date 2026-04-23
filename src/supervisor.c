@@ -9,8 +9,9 @@
 #include <string.h>
 #include <time.h>
 
-#define SUP_THRESHOLD_MIN  5        /* consecutive minutes to trigger */
-#define SUP_COOLDOWN_S     (60*60)  /* 1 hour trigger duration */
+/* Built-in defaults; overridable via supervisor_configure(). */
+#define SUP_DEFAULT_THRESHOLD_MIN  5
+#define SUP_DEFAULT_COOLDOWN_MIN   60
 
 /* Caps on user-controllable lists. Triggers are naturally bounded by the
  * number of LAN devices but we still refuse pathological sizes. */
@@ -18,9 +19,9 @@
 #define SUP_TRIGGERS_MAX   512
 
 typedef struct {
-    uint32_t ip;           /* 0 = empty slot */
+    uint32_t ip;             /* 0 = empty slot */
     int      consec;
-    bool     matched;      /* matched a target this minute */
+    uint64_t matched_bytes;  /* bytes to matched targets this minute */
 } sup_counter_t;
 
 typedef struct {
@@ -40,6 +41,10 @@ struct wg_supervisor {
 
     char       supervised_path[256];
     char       triggers_path  [256];
+
+    int        threshold_min;         /* consecutive minutes to trigger */
+    int        cooldown_s;            /* trigger duration in seconds */
+    uint64_t   min_bytes_per_min;     /* 0 = any byte counts */
 
     bool       dirty_targets;
     bool       dirty_triggers;
@@ -81,7 +86,18 @@ wg_supervisor_t *supervisor_new(const char *supervised_path,
     if (triggers_path)
         strncpy(s->triggers_path, triggers_path,
                 sizeof(s->triggers_path) - 1);
+    s->threshold_min     = SUP_DEFAULT_THRESHOLD_MIN;
+    s->cooldown_s        = SUP_DEFAULT_COOLDOWN_MIN * 60;
+    s->min_bytes_per_min = 0;
     return s;
+}
+
+void supervisor_configure(wg_supervisor_t *s, int threshold_min,
+                          int cooldown_min, int min_bytes_per_min) {
+    if (!s) return;
+    if (threshold_min > 0) s->threshold_min = threshold_min;
+    if (cooldown_min  > 0) s->cooldown_s    = cooldown_min * 60;
+    if (min_bytes_per_min >= 0) s->min_bytes_per_min = (uint64_t)min_bytes_per_min;
 }
 
 void supervisor_free(wg_supervisor_t *s) {
@@ -267,8 +283,8 @@ static sup_counter_t *find_counter(wg_supervisor_t *s, uint32_t ip, bool create)
 static void reset_counter_for_ip(wg_supervisor_t *s, uint32_t ip) {
     for (size_t i = 0; i < s->n_counters; i++) {
         if (s->counters[i].ip == ip) {
-            s->counters[i].consec  = 0;
-            s->counters[i].matched = false;
+            s->counters[i].consec        = 0;
+            s->counters[i].matched_bytes = 0;
             return;
         }
     }
@@ -277,11 +293,15 @@ static void reset_counter_for_ip(wg_supervisor_t *s, uint32_t ip) {
 /* --------------------------- observation ------------------------- */
 
 void supervisor_observe(wg_supervisor_t *s, uint32_t client_ip,
-                        const char *domain) {
+                        const char *domain, uint64_t bytes) {
     if (!s || client_ip == 0 || !domain) return;
     if (!supervisor_domain_matches(s, domain)) return;
     sup_counter_t *c = find_counter(s, client_ip, true);
-    if (c) c->matched = true;
+    if (!c) return;
+    /* Guard: a single flow that somehow reports 0 bytes still counts
+     * when min_bytes_per_min is 0 (tests rely on that); otherwise only
+     * real bytes accumulate. */
+    c->matched_bytes += bytes ? bytes : (s->min_bytes_per_min == 0 ? 1 : 0);
 }
 
 static void ip_to_canon(const wg_leases_t *leases, uint32_t ip,
@@ -302,7 +322,7 @@ static void add_trigger(wg_supervisor_t *s, const wg_leases_t *leases,
     char canon[64];
     ip_to_canon(leases, client_ip, canon, sizeof(canon));
 
-    int64_t until = now_wall + SUP_COOLDOWN_S;
+    int64_t until = now_wall + s->cooldown_s;
 
     /* update in place if already present */
     for (size_t i = 0; i < s->n_triggers; i++) {
@@ -338,10 +358,12 @@ void supervisor_commit_minute(wg_supervisor_t *s,
     if (!s) return;
     for (size_t i = 0; i < s->n_counters; i++) {
         sup_counter_t *c = &s->counters[i];
-        if (c->matched) {
+        bool active = c->matched_bytes >= s->min_bytes_per_min
+                      && c->matched_bytes > 0;
+        c->matched_bytes = 0;
+        if (active) {
             c->consec++;
-            c->matched = false;
-            if (c->consec >= SUP_THRESHOLD_MIN) {
+            if (c->consec >= s->threshold_min) {
                 add_trigger(s, leases, c->ip, now_wall, jl);
                 c->consec = 0;
             }
@@ -355,8 +377,8 @@ void supervisor_commit_minute(wg_supervisor_t *s,
 void supervisor_drop_minute(wg_supervisor_t *s) {
     if (!s) return;
     for (size_t i = 0; i < s->n_counters; i++) {
-        s->counters[i].matched = false;
-        s->counters[i].consec  = 0;
+        s->counters[i].matched_bytes = 0;
+        s->counters[i].consec        = 0;
     }
 }
 

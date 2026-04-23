@@ -27,8 +27,6 @@ static void defaults(wg_cfg_t *c) {
     memset(c, 0, sizeof(*c));
     set_str(c->iface,          sizeof(c->iface),          "eth1");
     set_str(c->network_cidr,   sizeof(c->network_cidr),   "10.6.6.0/24");
-    c->host_octet_lo = 64;
-    c->host_octet_hi = 240;
     set_str(c->dnsmasq_conf,   sizeof(c->dnsmasq_conf),   "/etc/dnsmasq.conf");
     set_str(c->dnsmasq_leases, sizeof(c->dnsmasq_leases), "/var/lib/misc/dnsmasq.leases");
     set_str(c->blocks_json,    sizeof(c->blocks_json),    "/opt/wgatectl/blocks.json");
@@ -45,13 +43,14 @@ static void defaults(wg_cfg_t *c) {
     set_str(c->ip_bin,         sizeof(c->ip_bin),         "/sbin/ip");
     c->static_cidr[0] = 0;
     c->flush_seconds = 60;
+    c->supervised_threshold_min      = 5;
+    c->supervised_cooldown_min       = 60;
+    c->supervised_min_bytes_per_min  = 32 * 1024;   /* 32 KiB / min */
 }
 
 static void apply_kv(wg_cfg_t *c, const char *k, const char *v) {
     if      (!strcmp(k, "WG_IFACE"))           set_str(c->iface,          sizeof(c->iface),          v);
     else if (!strcmp(k, "WG_NETWORK"))         set_str(c->network_cidr,   sizeof(c->network_cidr),   v);
-    else if (!strcmp(k, "WG_HOST_OCTET_LO"))   set_int(&c->host_octet_lo, v);
-    else if (!strcmp(k, "WG_HOST_OCTET_HI"))   set_int(&c->host_octet_hi, v);
     else if (!strcmp(k, "WG_DNSMASQ_CONF"))    set_str(c->dnsmasq_conf,   sizeof(c->dnsmasq_conf),   v);
     else if (!strcmp(k, "WG_DNSMASQ_LEASES"))  set_str(c->dnsmasq_leases, sizeof(c->dnsmasq_leases), v);
     else if (!strcmp(k, "WG_BLOCKS_JSON"))     set_str(c->blocks_json,    sizeof(c->blocks_json),    v);
@@ -68,6 +67,9 @@ static void apply_kv(wg_cfg_t *c, const char *k, const char *v) {
     else if (!strcmp(k, "WG_IP_BIN"))          set_str(c->ip_bin,         sizeof(c->ip_bin),         v);
     else if (!strcmp(k, "WG_STATIC_CIDR"))     set_str(c->static_cidr,    sizeof(c->static_cidr),    v);
     else if (!strcmp(k, "WG_FLUSH_SECONDS"))   set_int(&c->flush_seconds, v);
+    else if (!strcmp(k, "WG_SUPERVISED_THRESHOLD_MIN")) set_int(&c->supervised_threshold_min, v);
+    else if (!strcmp(k, "WG_SUPERVISED_COOLDOWN_MIN"))  set_int(&c->supervised_cooldown_min,  v);
+    else if (!strcmp(k, "WG_SUPERVISED_MIN_BYTES_PER_MIN")) set_int(&c->supervised_min_bytes_per_min, v);
 }
 
 static char *trim(char *s) {
@@ -104,7 +106,7 @@ static int load_file(wg_cfg_t *c, const char *path) {
 
 static void load_env(wg_cfg_t *c) {
     static const char *keys[] = {
-        "WG_IFACE", "WG_NETWORK", "WG_HOST_OCTET_LO", "WG_HOST_OCTET_HI",
+        "WG_IFACE", "WG_NETWORK",
         "WG_DNSMASQ_CONF", "WG_DNSMASQ_LEASES", "WG_BLOCKS_JSON",
         "WG_SCHEDULE_JSON", "WG_SUPERVISED_JSON",
         "WG_GRANTS_JSON", "WG_TRIGGERS_JSON",
@@ -112,6 +114,8 @@ static void load_env(wg_cfg_t *c) {
         "WG_SOCK", "WG_SOCK_GROUP",
         "WG_IPTABLES_BIN", "WG_IPSET_BIN", "WG_IP_BIN", "WG_STATIC_CIDR",
         "WG_FLUSH_SECONDS",
+        "WG_SUPERVISED_THRESHOLD_MIN", "WG_SUPERVISED_COOLDOWN_MIN",
+        "WG_SUPERVISED_MIN_BYTES_PER_MIN",
         NULL
     };
     for (int i = 0; keys[i]; i++) {
@@ -135,8 +139,11 @@ int cfg_load(wg_cfg_t *cfg, const char *conf_path_or_null) {
     }
     if (cfg->flush_seconds < 10)  cfg->flush_seconds = 10;
     if (cfg->flush_seconds > 600) cfg->flush_seconds = 600;
-    if (cfg->host_octet_lo < 0)   cfg->host_octet_lo = 0;
-    if (cfg->host_octet_hi > 256) cfg->host_octet_hi = 256;
+    if (cfg->supervised_threshold_min < 1)   cfg->supervised_threshold_min = 1;
+    if (cfg->supervised_threshold_min > 120) cfg->supervised_threshold_min = 120;
+    if (cfg->supervised_cooldown_min  < 1)        cfg->supervised_cooldown_min = 1;
+    if (cfg->supervised_cooldown_min  > 24 * 60)  cfg->supervised_cooldown_min = 24 * 60;
+    if (cfg->supervised_min_bytes_per_min < 0)    cfg->supervised_min_bytes_per_min = 0;
 
     /* Resolve external binaries. We search standard locations if the
      * configured path doesn't exist, so users don't hit cryptic rc=127

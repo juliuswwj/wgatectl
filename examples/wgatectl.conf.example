@@ -5,17 +5,11 @@
 # defaults.
 
 # The LAN-facing interface to capture on.
-WG_IFACE=eth1
+WG_IFACE=lan
 
 # The LAN subnet.  Only packets whose source or destination falls inside
 # this subnet are considered.
 WG_NETWORK=10.6.6.0/24
-
-# Last-octet window used to limit per-client tracking to "real" device IPs
-# (skips the gateway, broadcast, DHCP range boundaries, ...).  Defaults
-# mirror rtset.py's behaviour.
-WG_HOST_OCTET_LO=64
-WG_HOST_OCTET_HI=240
 
 # Paths to the dnsmasq state files.
 WG_DNSMASQ_CONF=/etc/dnsmasq.conf
@@ -31,8 +25,20 @@ WG_SCHEDULE_JSON=/opt/wgatectl/schedule.json
 
 # Supervised-mode targets: JSON array of domain suffixes (case-insensitive,
 # label-boundary match).  The supervisor fully blocks any device whose
-# traffic hits any of these for 5 consecutive minutes, for 1 hour.
+# traffic hits any of these for N consecutive minutes, for M minutes.
 WG_SUPERVISED_JSON=/opt/wgatectl/supervised.json
+
+# Supervisor trigger threshold and cool-down, in minutes.  Defaults:
+# 5 minutes of consecutive matching traffic triggers a 60-minute block.
+# Clamped to [1, 120] and [1, 1440] respectively.
+WG_SUPERVISED_THRESHOLD_MIN=5
+WG_SUPERVISED_COOLDOWN_MIN=60
+
+# Minimum matched-domain traffic per minute (bytes) for the minute to
+# count toward the consecutive-trigger counter.  Keepalives / idle
+# heartbeats of a backgrounded app stay under this and don't accrue.
+# Set to 0 to make any matching packet count.
+WG_SUPERVISED_MIN_BYTES_PER_MIN=32768
 
 # Per-device timed grants (JSON array of {key, until, reason}).  Populated
 # and persisted by the /hosts/{key}/grant endpoint.

@@ -195,8 +195,11 @@ The tail of FORWARD (after external rules) looks like:
 -A FORWARD -s 10.6.6.159/32 -j DROP                      # per-device block
  …
 -A FORWARD -i <lan> -j DROP                              # only when mode=closed
--A FORWARD -j ACCEPT                                     # catch-all
 ```
+
+FORWARD's default policy is ACCEPT, so traffic that falls off the end
+of our block is already allowed; we deliberately do not append a
+trailing `-j ACCEPT` that would mask admin-added DROPs below.
 
 Requires the `iptables-mod-comment` (xt_comment) module, which is
 standard in modern iptables installs.

@@ -27,6 +27,7 @@ typedef struct wg_arp_bind {
     bool      active;           /* false when static_cidr is empty/unparseable */
     uint32_t  cidr_addr;        /* host-order */
     uint32_t  cidr_mask;
+    uint32_t  self_ip;          /* iface's own IPv4 (host-order); 0 if unknown */
 
     uint32_t *bound_ips;        /* IPs currently pinned, in host order */
     size_t    n_bound, cap_bound;

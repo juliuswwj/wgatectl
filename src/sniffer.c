@@ -31,7 +31,6 @@ struct wg_sniffer {
 
     uint32_t          net_addr;
     uint32_t          net_mask;
-    int               host_lo, host_hi;
 
     ipset_mgr_t      *ipset;
     wg_metrics_t     *metrics;
@@ -210,9 +209,7 @@ static void answer_visit(void *vctx, uint32_t ip, uint32_t ttl) {
 }
 
 static bool in_lan(struct wg_sniffer *s, uint32_t ip) {
-    if (!ip_in_subnet(ip, s->net_addr, s->net_mask)) return false;
-    int o = (int)(ip & 0xFF);
-    return o >= s->host_lo && o < s->host_hi;
+    return ip_in_subnet(ip, s->net_addr, s->net_mask);
 }
 
 static void handle_dns(struct wg_sniffer *s, uint32_t src_ip, uint32_t dst_ip,
@@ -311,8 +308,6 @@ wg_sniffer_t *sniffer_open(const wg_sniffer_cfg_t *cfg) {
     if (!s) return NULL;
     s->net_addr = cfg->net_addr;
     s->net_mask = cfg->net_mask;
-    s->host_lo  = cfg->host_octet_lo;
-    s->host_hi  = cfg->host_octet_hi;
     s->ipset    = cfg->ipset;
     s->metrics  = cfg->metrics;
 

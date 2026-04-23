@@ -13,8 +13,6 @@ typedef struct {
     const char    *iface;
     uint32_t       net_addr;       /* host-order */
     uint32_t       net_mask;
-    int            host_octet_lo;  /* inclusive */
-    int            host_octet_hi;  /* exclusive */
     ipset_mgr_t   *ipset;
     wg_metrics_t  *metrics;
 } wg_sniffer_cfg_t;

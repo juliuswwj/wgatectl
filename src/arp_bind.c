@@ -2,11 +2,16 @@
 #include "log.h"
 #include "util.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -87,6 +92,27 @@ static int neigh_del(const wg_arp_bind_t *ab, uint32_t ip) {
     return run_quiet(ab->ip_bin, argv);
 }
 
+/* --------------------- interface self-IP lookup ---------------------- */
+
+/* Query the kernel for the primary IPv4 address on `iface`. Returns 0 if
+ * no address is assigned (yet) — caller treats that as "don't skip anything
+ * in the CIDR loop"; the gateway case is simply not detected. */
+static uint32_t lookup_iface_ip(const char *iface) {
+    if (!iface || !*iface) return 0;
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 0;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    size_t ifn = strnlen(iface, IFNAMSIZ - 1);
+    memcpy(ifr.ifr_name, iface, ifn);
+    ifr.ifr_name[ifn] = 0;
+    if (ioctl(fd, SIOCGIFADDR, &ifr) < 0) { close(fd); return 0; }
+    close(fd);
+    if (ifr.ifr_addr.sa_family != AF_INET) return 0;
+    struct sockaddr_in *sa = (struct sockaddr_in *)&ifr.ifr_addr;
+    return ntohl(sa->sin_addr.s_addr);
+}
+
 /* ------------------------------ init ---------------------------------- */
 
 int arp_bind_init(wg_arp_bind_t *ab, const char *ip_bin,
@@ -114,6 +140,11 @@ int arp_bind_init(wg_arp_bind_t *ab, const char *ip_bin,
               static_cidr, WG_ARP_MAX_PINS);
         return -1;
     }
+    ab->self_ip = lookup_iface_ip(ab->iface);
+    if (ab->self_ip) {
+        char buf[16]; ip_format(ab->self_ip, buf);
+        LOG_I("arp_bind: skipping own iface IP %s on %s", buf, ab->iface);
+    }
     ab->active = true;
     return 0;
 }
@@ -134,6 +165,16 @@ static void append_u32(uint32_t **arr, size_t *n, size_t *cap, uint32_t v) {
 void arp_bind_apply(wg_arp_bind_t *ab, const wg_leases_t *leases) {
     if (!ab || !ab->active) return;
 
+    /* Re-query each apply: on boot the iface may not have an IP yet
+     * when init ran, and a later SIGHUP is the natural place to pick
+     * it up. Cheap ioctl, called a handful of times per day. */
+    uint32_t ip_now = lookup_iface_ip(ab->iface);
+    if (ip_now && ip_now != ab->self_ip) {
+        char buf[16]; ip_format(ip_now, buf);
+        LOG_I("arp_bind: iface IP is %s; will skip it", buf);
+        ab->self_ip = ip_now;
+    }
+
     /* Build a flat list of (ip, mac_text) pairs we want pinned. */
     typedef struct { uint32_t ip; char mac[18]; } pin_t;
     pin_t *pins = NULL;
@@ -142,8 +183,10 @@ void arp_bind_apply(wg_arp_bind_t *ab, const wg_leases_t *leases) {
     uint32_t lo = ab->cidr_addr;
     uint32_t hi = ab->cidr_addr | ~ab->cidr_mask;
 
-    /* 1) every IP in the CIDR (except network and broadcast) */
+    /* 1) every IP in the CIDR (except network, broadcast, and our own
+     *    iface IP — pinning the gateway to itself is a weird no-op) */
     for (uint32_t ip = lo + 1; ip < hi; ip++) {
+        if (ip == ab->self_ip) continue;
         const wg_lease_t *l = leases_by_ip(leases, ip);
         const char *mac_str;
         char macbuf[18];
@@ -170,6 +213,7 @@ void arp_bind_apply(wg_arp_bind_t *ab, const wg_leases_t *leases) {
         for (size_t i = 0; i < leases->n; i++) {
             const wg_lease_t *l = &leases->items[i];
             if (!l->is_static) continue;
+            if (l->ip == ab->self_ip) continue;
             if (l->ip > lo && l->ip < hi) continue;   /* already included */
             if (n_pins == cap_pins) {
                 size_t nc = cap_pins ? cap_pins * 2 : 64;
