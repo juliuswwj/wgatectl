@@ -24,6 +24,24 @@ WG_DNSMASQ_LEASES=/var/lib/misc/dnsmasq.leases
 # Block-list persistence (a JSON array of IP or name strings).
 WG_BLOCKS_JSON=/opt/wgatectl/blocks.json
 
+# Schedule state (weekly base + pending one-shot overrides).  If missing,
+# the hard-coded defaults apply (07:00 supervised, 18:00 open, Tue/Fri/Sat
+# 23:30 closed, Mon/Wed/Thu/Sun 22:30 closed).
+WG_SCHEDULE_JSON=/opt/wgatectl/schedule.json
+
+# Supervised-mode targets: JSON array of domain suffixes (case-insensitive,
+# label-boundary match).  The supervisor fully blocks any device whose
+# traffic hits any of these for 5 consecutive minutes, for 1 hour.
+WG_SUPERVISED_JSON=/opt/wgatectl/supervised.json
+
+# Per-device timed grants (JSON array of {key, until, reason}).  Populated
+# and persisted by the /hosts/{key}/grant endpoint.
+WG_GRANTS_JSON=/opt/wgatectl/grants.json
+
+# Supervisor trigger list (JSON array of {key, until}).  Managed
+# automatically; lives here so a restart doesn't release triggers early.
+WG_TRIGGERS_JSON=/opt/wgatectl/triggers.json
+
 # Where the per-minute JSONL events go.  Files are named events-YYYYMMDD.jsonl.
 # The daemon creates this directory if it doesn't exist.
 WG_JSONL_DIR=/opt/wgatectl
@@ -35,10 +53,18 @@ WG_JSONL_RETAIN=14
 WG_SOCK=/opt/wgatectl/wgatectl.sock
 WG_SOCK_GROUP=wgate
 
+# Static-assignment zone: CIDR exempted from every FORWARD rule and
+# proactively ARP-pinned on the LAN interface.  Devices listed as
+# `dhcp-host=...` in dnsmasq.conf are pinned to their MAC; the remaining
+# slots in the CIDR are pinned to a DUMMY MAC so they black-hole.
+# Leave empty to disable both the exempt rule and the ARP binding.
+WG_STATIC_CIDR=10.6.6.0/27
+
 # External binaries (absolute paths so the daemon works under a strict
 # systemd sandbox).
 WG_IPTABLES_BIN=/sbin/iptables
 WG_IPSET_BIN=/sbin/ipset
+WG_IP_BIN=/sbin/ip
 
 # Metrics flush cadence.  The main tick fires every second; this knob
 # controls the JSONL flush period and iptables self-heal reconcile.

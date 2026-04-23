@@ -1,7 +1,10 @@
 #include "ipc.h"
+#include "arp_bind.h"
 #include "json.h"
 #include "log.h"
 #include "metrics.h"
+#include "schedule.h"
+#include "supervisor.h"
 #include "util.h"
 
 #include <errno.h>
@@ -10,15 +13,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
 
-#define IPC_MAX_CLIENTS 16
-#define IPC_HDR_CAP     8192
-#define IPC_BODY_CAP    (64 * 1024)
+#define IPC_MAX_CLIENTS   16
+#define IPC_HDR_CAP       8192
+#define IPC_BODY_CAP      (64 * 1024)
+#define IPC_CLIENT_TIMEOUT_NS  (10ull * 1000000000ull)   /* 10 seconds */
 
 typedef enum {
     ST_READ_HDR,
@@ -42,6 +47,7 @@ typedef struct {
     size_t          resp_len;
     size_t          resp_off;
     bool            is_new;
+    uint64_t        deadline_ns;     /* CLOCK_MONOTONIC; 0 = none */
 } client_t;
 
 struct wg_ipc {
@@ -70,6 +76,10 @@ static client_t *client_by_fd(wg_ipc_t *ipc, int fd) {
     for (int i = 0; i < IPC_MAX_CLIENTS; i++)
         if (ipc->clients[i].fd == fd) return &ipc->clients[i];
     return NULL;
+}
+
+static void client_touch(client_t *c) {
+    c->deadline_ns = now_mono_ns() + IPC_CLIENT_TIMEOUT_NS;
 }
 
 /* -------------------- response building -------------------- */
@@ -178,6 +188,9 @@ static const char *query_string(const client_t *c) {
     return q ? q + 1 : NULL;
 }
 
+/* In-place percent-decode. Rejects embedded NUL (%00): the input stays
+ * unchanged and the first byte becomes 0 so the caller's string-based
+ * consumers see it as empty. */
 static void url_decode(char *s) {
     char *r = s, *w = s;
     while (*r) {
@@ -189,7 +202,13 @@ static void url_decode(char *s) {
             int v2 = (h2 >= '0' && h2 <= '9') ? h2 - '0'
                    : (h2 >= 'a' && h2 <= 'f') ? h2 - 'a' + 10
                    : (h2 >= 'A' && h2 <= 'F') ? h2 - 'A' + 10 : -1;
-            if (v1 >= 0 && v2 >= 0) { *w++ = (char)((v1 << 4) | v2); r += 3; continue; }
+            if (v1 >= 0 && v2 >= 0) {
+                char b = (char)((v1 << 4) | v2);
+                if (b == 0) { s[0] = 0; return; }   /* reject %00 */
+                *w++ = b;
+                r += 3;
+                continue;
+            }
         }
         *w++ = *r++;
     }
@@ -220,23 +239,17 @@ static char *query_get(const char *qs, const char *key) {
 
 /* -------------------- iptables-reconcile after change ----------------- */
 
-static void rebuild_blockset(const wg_ipc_app_t *app, wg_block_set_t *out) {
-    wg_block_set_init(out);
-    const wg_blocks_t *b = app->blocks;
-    for (size_t i = 0; i < b->n; i++) {
-        uint32_t ip;
-        if (!blocks_resolve_ip(app->leases, b->keys[i], &ip)) continue;
-        if (!ip_in_subnet(ip, app->cfg->net_addr, app->cfg->net_mask)) continue;
-        wg_block_set_add(out, ip);
-    }
+/* Ask the supervisor loop in main.c to re-apply iptables. The callback
+ * is expected to coalesce requests (at most one actual iptables pass
+ * every few seconds) so that an API spammer cannot flood the netfilter
+ * fast path. */
+static void do_reconcile(wg_ipc_app_t *app) {
+    if (app && app->reconcile_request_cb)
+        app->reconcile_request_cb(app->reconcile_cb_arg);
 }
 
 static void reconcile_after_change(wg_ipc_app_t *app) {
-    wg_block_set_t b;
-    rebuild_blockset(app, &b);
-    iptables_reconcile(app->ipt, app->cfg->net_addr, app->cfg->net_mask,
-                       &b, NULL, NULL);
-    wg_block_set_free(&b);
+    do_reconcile(app);
     blocks_save(app->blocks);
 }
 
@@ -253,6 +266,11 @@ static void handle_status(wg_ipc_t *ipc, client_t *c) {
     json_ki64(&j, "lease_count",   (int)ipc->app->leases->n);
     json_kstr(&j, "iface",   ipc->app->cfg->iface);
     json_kstr(&j, "network", ipc->app->cfg->network_cidr);
+    int64_t now = now_wall_s();
+    int64_t next = 0;
+    sch_mode_t mode = schedule_effective_mode(ipc->app->sched, now, &next);
+    json_kstr(&j, "mode", sch_mode_name(mode));
+    if (next) json_ki64(&j, "next_transition", next);
     json_obj_end(&j);
     respond_json(c, 200, &j);
     json_out_free(&j);
@@ -303,7 +321,7 @@ static void handle_hosts(wg_ipc_t *ipc, client_t *c) {
 }
 
 /* Extract "/hosts/<key>/<action>" → key, action. Returns action pointer. */
-static const char *path_after_key(char *path, const char *prefix,
+static const char *path_after_key(const char *path, const char *prefix,
                                   char *key_out, size_t key_cap) {
     size_t pl = strlen(prefix);
     if (strncmp(path, prefix, pl) != 0) return NULL;
@@ -322,8 +340,40 @@ static void handle_host_action(wg_ipc_t *ipc, client_t *c,
     wg_ipc_app_t *app = ipc->app;
     bool want_block = (strcmp(action, "block") == 0);
     bool want_allow = (strcmp(action, "allow") == 0);
-    if (!want_block && !want_allow) {
+    bool want_grant = (strcmp(action, "grant") == 0);
+    if (!want_block && !want_allow && !want_grant) {
         respond_simple(c, 404, "unknown action");
+        return;
+    }
+
+    if (want_grant) {
+        char *mstr = query_get(query_string(c), "minutes");
+        int minutes = mstr ? atoi(mstr) : 0;
+        free(mstr);
+        if (minutes <= 0) {
+            respond_simple(c, 400, "minutes must be > 0");
+            return;
+        }
+        char *reason = query_get(query_string(c), "reason");
+        int rc = schedule_grant_add(app->sched, app->leases, key, minutes, reason);
+        free(reason);
+        if (rc) {
+            do_reconcile(app);
+            char ipbuf[16] = "";
+            uint32_t ip;
+            if (blocks_resolve_ip(app->leases, key, &ip)) ip_format(ip, ipbuf);
+            metrics_emit_control(app->jl, now_wall_s(),
+                                 key, ipbuf[0] ? ipbuf : NULL,
+                                 "grant", "api");
+        }
+        json_out_t j; json_out_init(&j);
+        json_obj_begin(&j);
+        json_kbool(&j, "ok", true);
+        json_kstr (&j, "host", key);
+        json_ki64 (&j, "minutes", minutes);
+        json_obj_end(&j);
+        respond_json(c, 200, &j);
+        json_out_free(&j);
         return;
     }
 
@@ -351,47 +401,190 @@ static void handle_host_action(wg_ipc_t *ipc, client_t *c,
     json_out_free(&j);
 }
 
-static void handle_dhcp_range(wg_ipc_t *ipc, client_t *c, bool block) {
+static void handle_grant_delete(wg_ipc_t *ipc, client_t *c, const char *key) {
     wg_ipc_app_t *app = ipc->app;
-    uint32_t lo, hi;
-    if (!leases_dhcp_range(app->leases, &lo, &hi)) {
-        respond_simple(c, 404, "no dhcp-range in dnsmasq.conf");
+    int removed = schedule_grant_remove(app->sched, app->leases, key);
+    if (removed) {
+        do_reconcile(app);
+        metrics_emit_control(app->jl, now_wall_s(), key, NULL,
+                             "revoke", "api");
+    }
+    json_out_t j; json_out_init(&j);
+    json_obj_begin(&j);
+    json_kbool(&j, "ok", true);
+    json_kbool(&j, "changed", removed != 0);
+    json_obj_end(&j);
+    respond_json(c, 200, &j);
+    json_out_free(&j);
+}
+
+/* --------------------- schedule handlers ----------------------- */
+
+static void handle_schedule_get(wg_ipc_t *ipc, client_t *c) {
+    json_out_t j;
+    json_out_init(&j);
+    schedule_dump_json(ipc->app->sched, now_wall_s(), &j);
+    respond_json(c, 200, &j);
+    json_out_free(&j);
+}
+
+/* Extract path suffix after `prefix` into `out`; returns false if the
+ * suffix is empty. Trims a trailing slash. */
+static bool path_suffix(const char *path, const char *prefix,
+                        char *out, size_t cap) {
+    size_t pl = strlen(prefix);
+    if (strncmp(path, prefix, pl) != 0) return false;
+    const char *s = path + pl;
+    if (!*s) return false;
+    size_t n = strlen(s);
+    while (n && s[n-1] == '/') n--;
+    if (!n || n >= cap) return false;
+    memcpy(out, s, n);
+    out[n] = 0;
+    return true;
+}
+
+static void handle_override_add(wg_ipc_t *ipc, client_t *c) {
+    wg_ipc_app_t *app = ipc->app;
+    if (!c->body || c->body_len == 0) {
+        respond_simple(c, 400, "body required");
         return;
     }
-    int n_affected = 0;
-    json_out_t aff; json_out_init(&aff);
-    json_arr_begin(&aff);
-    for (uint32_t ip = lo; ip <= hi; ip++) {
-        const wg_lease_t *l = leases_by_ip(app->leases, ip);
-        if (l && l->is_static) continue;
-        char ipbuf[16];
-        ip_format(ip, ipbuf);
-        int changed = block
-            ? blocks_add   (app->blocks, app->leases, ipbuf)
-            : blocks_remove(app->blocks, app->leases, ipbuf);
-        if (changed) {
-            json_str(&aff, ipbuf);
-            n_affected++;
-        }
+    const char *err = NULL;
+    json_val_t *v = json_parse(c->body, c->body_len, &err);
+    if (!v || v->type != JV_OBJ) {
+        if (v) json_val_free(v);
+        respond_simple(c, 400, err ? err : "bad json");
+        return;
     }
-    json_arr_end(&aff);
-    if (n_affected > 0) {
-        reconcile_after_change(app);
-        metrics_emit_control(app->jl, now_wall_s(),
-                             "dhcp-range", NULL,
-                             block ? "block" : "allow", "api");
+    int64_t at = 0, expires_at = 0;
+    const char *mode_str = NULL, *reason = NULL;
+    json_get_i64(json_obj_get(v, "at"),         &at);
+    json_get_i64(json_obj_get(v, "expires_at"), &expires_at);
+    json_get_str(json_obj_get(v, "mode"),       &mode_str);
+    json_get_str(json_obj_get(v, "reason"),     &reason);
+
+    sch_mode_t m;
+    if (!sch_mode_parse(mode_str, &m)) {
+        json_val_free(v);
+        respond_simple(c, 400, "mode must be closed|supervised|open");
+        return;
     }
+    if (at == 0) at = now_wall_s();
+    if (expires_at && expires_at <= at) {
+        json_val_free(v);
+        respond_simple(c, 400, "expires_at must be > at");
+        return;
+    }
+
+    char id[24];
+    int rc = schedule_override_add(app->sched, at, m, expires_at, reason,
+                                   id, sizeof(id));
+    json_val_free(v);
+    if (rc < 0) { respond_simple(c, 500, "override add failed"); return; }
+
+    do_reconcile(app);
+    metrics_emit_control(app->jl, now_wall_s(), "dhcp-range", NULL,
+                         sch_mode_name(m), "api");
 
     json_out_t j; json_out_init(&j);
     json_obj_begin(&j);
     json_kbool(&j, "ok", true);
-    json_ki64 (&j, "affected_count", n_affected);
-    json_key  (&j, "affected");
-    json_raw  (&j, aff.buf ? aff.buf : "[]");
+    json_kstr (&j, "id", id);
     json_obj_end(&j);
     respond_json(c, 200, &j);
     json_out_free(&j);
-    json_out_free(&aff);
+}
+
+static void handle_override_remove(wg_ipc_t *ipc, client_t *c,
+                                   const char *id) {
+    wg_ipc_app_t *app = ipc->app;
+    int removed = schedule_override_remove(app->sched, id);
+    if (removed) do_reconcile(app);
+    json_out_t j; json_out_init(&j);
+    json_obj_begin(&j);
+    json_kbool(&j, "ok", true);
+    json_kbool(&j, "changed", removed != 0);
+    json_obj_end(&j);
+    respond_json(c, 200, &j);
+    json_out_free(&j);
+}
+
+static void handle_mode_force(wg_ipc_t *ipc, client_t *c,
+                              const char *mode_str) {
+    wg_ipc_app_t *app = ipc->app;
+    sch_mode_t m;
+    if (!sch_mode_parse(mode_str, &m)) {
+        respond_simple(c, 404, "unknown mode");
+        return;
+    }
+    int64_t now = now_wall_s();
+    int64_t expires_at = 0;
+    char *until = query_get(query_string(c), "until");
+    if (until) {
+        expires_at = strtoll(until, NULL, 10);
+        free(until);
+        if (expires_at && expires_at <= now) {
+            respond_simple(c, 400, "until must be in the future");
+            return;
+        }
+    }
+    char *reason = query_get(query_string(c), "reason");
+    char id[24];
+    int rc = schedule_override_add(app->sched, now, m, expires_at, reason,
+                                   id, sizeof(id));
+    free(reason);
+    if (rc < 0) { respond_simple(c, 500, "override add failed"); return; }
+
+    do_reconcile(app);
+    metrics_emit_control(app->jl, now, "dhcp-range", NULL,
+                         sch_mode_name(m), "api");
+
+    json_out_t j; json_out_init(&j);
+    json_obj_begin(&j);
+    json_kbool(&j, "ok", true);
+    json_kstr (&j, "mode", sch_mode_name(m));
+    json_kstr (&j, "id", id);
+    if (expires_at) json_ki64(&j, "expires_at", expires_at);
+    json_obj_end(&j);
+    respond_json(c, 200, &j);
+    json_out_free(&j);
+}
+
+/* --------------------- supervised handlers --------------------- */
+
+static void handle_supervised_list(wg_ipc_t *ipc, client_t *c) {
+    json_out_t j;
+    json_out_init(&j);
+    supervisor_dump_json(ipc->app->sup, now_wall_s(), &j);
+    respond_json(c, 200, &j);
+    json_out_free(&j);
+}
+
+static void handle_supervised_add(wg_ipc_t *ipc, client_t *c,
+                                  const char *domain) {
+    int changed = supervisor_add_target(ipc->app->sup, domain);
+    json_out_t j; json_out_init(&j);
+    json_obj_begin(&j);
+    json_kbool(&j, "ok", true);
+    json_kstr (&j, "target", domain);
+    json_kbool(&j, "changed", changed != 0);
+    json_obj_end(&j);
+    respond_json(c, 200, &j);
+    json_out_free(&j);
+}
+
+static void handle_supervised_remove(wg_ipc_t *ipc, client_t *c,
+                                     const char *domain) {
+    int changed = supervisor_remove_target(ipc->app->sup, domain);
+    json_out_t j; json_out_init(&j);
+    json_obj_begin(&j);
+    json_kbool(&j, "ok", true);
+    json_kstr (&j, "target", domain);
+    json_kbool(&j, "changed", changed != 0);
+    json_obj_end(&j);
+    respond_json(c, 200, &j);
+    json_out_free(&j);
 }
 
 static int tail_cb(void *vctx, const char *line, size_t len) {
@@ -426,7 +619,10 @@ static void handle_metrics_tail(wg_ipc_t *ipc, client_t *c) {
 static void handle_reload(wg_ipc_t *ipc, client_t *c) {
     wg_ipc_app_t *app = ipc->app;
     leases_reload(app->leases, app->cfg->dnsmasq_conf, app->cfg->dnsmasq_leases);
-    reconcile_after_change(app);
+    if (app->ab) arp_bind_apply(app->ab, app->leases);
+    schedule_load(app->sched);
+    supervisor_load(app->sup);
+    do_reconcile(app);
     respond_simple(c, 200, NULL);
 }
 
@@ -434,31 +630,55 @@ static void handle_reload(wg_ipc_t *ipc, client_t *c) {
 
 static void dispatch(wg_ipc_t *ipc, client_t *c) {
     char keybuf[128];
+    char suffix[128];
     const char *action;
+    const char *m = c->method;
+    const char *p = c->path;
 
-    if (strcmp(c->method, "GET") == 0 && strcmp(c->path, "/status") == 0) {
-        handle_status(ipc, c); return;
+    if (strcmp(m, "GET") == 0) {
+        if (strcmp(p, "/status")       == 0) { handle_status(ipc, c);       return; }
+        if (strcmp(p, "/hosts")        == 0) { handle_hosts(ipc, c);        return; }
+        if (strcmp(p, "/schedule")     == 0) { handle_schedule_get(ipc, c); return; }
+        if (strcmp(p, "/supervised")   == 0) { handle_supervised_list(ipc, c); return; }
+        if (strcmp(p, "/metrics/tail") == 0) { handle_metrics_tail(ipc, c); return; }
+        respond_simple(c, 404, "no such route");
+        return;
     }
-    if (strcmp(c->method, "GET") == 0 && strcmp(c->path, "/hosts") == 0) {
-        handle_hosts(ipc, c); return;
+
+    if (strcmp(m, "POST") == 0) {
+        if ((action = path_after_key(p, "/hosts/", keybuf, sizeof(keybuf))) != NULL) {
+            handle_host_action(ipc, c, keybuf, action); return;
+        }
+        if (strcmp(p, "/schedule/override") == 0) {
+            handle_override_add(ipc, c); return;
+        }
+        if (path_suffix(p, "/mode/", suffix, sizeof(suffix))) {
+            handle_mode_force(ipc, c, suffix); return;
+        }
+        if (path_suffix(p, "/supervised/", suffix, sizeof(suffix))) {
+            handle_supervised_add(ipc, c, suffix); return;
+        }
+        if (strcmp(p, "/reload") == 0) { handle_reload(ipc, c); return; }
+        respond_simple(c, 404, "no such route");
+        return;
     }
-    if (strcmp(c->method, "POST") == 0 &&
-        (action = path_after_key(c->path, "/hosts/", keybuf, sizeof(keybuf))) != NULL) {
-        handle_host_action(ipc, c, keybuf, action); return;
+
+    if (strcmp(m, "DELETE") == 0) {
+        if (path_suffix(p, "/schedule/override/", suffix, sizeof(suffix))) {
+            handle_override_remove(ipc, c, suffix); return;
+        }
+        if ((action = path_after_key(p, "/hosts/", keybuf, sizeof(keybuf))) != NULL
+            && strcmp(action, "grant") == 0) {
+            handle_grant_delete(ipc, c, keybuf); return;
+        }
+        if (path_suffix(p, "/supervised/", suffix, sizeof(suffix))) {
+            handle_supervised_remove(ipc, c, suffix); return;
+        }
+        respond_simple(c, 404, "no such route");
+        return;
     }
-    if (strcmp(c->method, "POST") == 0 && strcmp(c->path, "/dhcp-range/allow") == 0) {
-        handle_dhcp_range(ipc, c, false); return;
-    }
-    if (strcmp(c->method, "POST") == 0 && strcmp(c->path, "/dhcp-range/block") == 0) {
-        handle_dhcp_range(ipc, c, true); return;
-    }
-    if (strcmp(c->method, "GET") == 0 && strcmp(c->path, "/metrics/tail") == 0) {
-        handle_metrics_tail(ipc, c); return;
-    }
-    if (strcmp(c->method, "POST") == 0 && strcmp(c->path, "/reload") == 0) {
-        handle_reload(ipc, c); return;
-    }
-    respond_simple(c, 404, "no such route");
+
+    respond_simple(c, 405, "method not allowed");
 }
 
 /* -------------------- accept / event loop -------------------- */
@@ -480,6 +700,7 @@ int ipc_accept(wg_ipc_t *ipc) {
         c->fd = cfd;
         c->st = ST_READ_HDR;
         c->is_new = true;
+        client_touch(c);
         accepted++;
     }
     return accepted;
@@ -509,6 +730,7 @@ static int do_read_hdr(client_t *c) {
         return -1;
     }
     if (r == 0) return -1;
+    client_touch(c);
     c->hdr_len += (size_t)r;
 
     size_t body_off = 0;
@@ -551,6 +773,7 @@ static int do_read_body(client_t *c) {
         return -1;
     }
     if (r == 0) return -1;
+    client_touch(c);
     c->body_len += (size_t)r;
     c->body[c->body_len] = 0;
     if (c->body_len >= c->content_length) c->st = ST_DONE;
@@ -566,25 +789,38 @@ static int do_write(client_t *c) {
         if (errno == EINTR) return 0;
         return -1;
     }
+    client_touch(c);
     c->resp_off += (size_t)w;
     return c->resp_off >= c->resp_len ? 1 : 0;
 }
 
-int ipc_on_client_event(wg_ipc_t *ipc, int fd) {
+static unsigned int client_wants(const client_t *c) {
+    switch (c->st) {
+        case ST_READ_HDR:
+        case ST_READ_BODY:
+        case ST_DONE:
+            return EPOLLIN;
+        case ST_WRITE_RESP:
+            return EPOLLOUT;
+    }
+    return EPOLLIN;
+}
+
+unsigned int ipc_on_client_event(wg_ipc_t *ipc, int fd) {
     client_t *c = client_by_fd(ipc, fd);
-    if (!c) return -1;
+    if (!c) return 0;
 
     for (;;) {
         if (c->st == ST_READ_HDR) {
             int r = do_read_hdr(c);
             if (r < 0) { client_reset(c); return 0; }
-            if (r == 0) return 0;
+            if (r == 0) return client_wants(c);
             if (c->st == ST_READ_HDR) continue;
         }
         if (c->st == ST_READ_BODY) {
             int r = do_read_body(c);
             if (r < 0) { client_reset(c); return 0; }
-            if (r == 0) return 0;
+            if (r == 0) return client_wants(c);
         }
         if (c->st == ST_DONE) {
             dispatch(ipc, c);
@@ -593,11 +829,26 @@ int ipc_on_client_event(wg_ipc_t *ipc, int fd) {
         if (c->st == ST_WRITE_RESP) {
             int r = do_write(c);
             if (r < 0) { client_reset(c); return 0; }
-            if (r == 0) return 0;
+            if (r == 0) return client_wants(c);
             client_reset(c);
             return 0;
         }
     }
+}
+
+int ipc_sweep_timeouts(wg_ipc_t *ipc, uint64_t now_ns) {
+    if (!ipc) return 0;
+    int closed = 0;
+    for (int i = 0; i < IPC_MAX_CLIENTS; i++) {
+        client_t *c = &ipc->clients[i];
+        if (c->fd < 0) continue;
+        if (c->deadline_ns && now_ns >= c->deadline_ns) {
+            LOG_W("ipc: client fd=%d timed out in state=%d", c->fd, c->st);
+            client_reset(c);
+            closed++;
+        }
+    }
+    return closed;
 }
 
 int ipc_fd(const wg_ipc_t *ipc) { return ipc ? ipc->listen_fd : -1; }
@@ -632,7 +883,21 @@ wg_ipc_t *ipc_open(const wg_cfg_t *cfg, wg_ipc_app_t *app) {
         if (mkdir_p(parent, 0755) < 0)
             LOG_W("mkdir_p(%s): %s", parent, strerror(errno));
     }
-    unlink(cfg->sock_path);
+    /* Refuse to unlink anything that isn't a stale AF_UNIX socket — a
+     * misconfigured sock_path pointing at /etc/shadow or a user file
+     * would otherwise get wiped on every restart. */
+    struct stat sst;
+    if (lstat(cfg->sock_path, &sst) == 0) {
+        if (S_ISSOCK(sst.st_mode)) {
+            unlink(cfg->sock_path);
+        } else {
+            LOG_E("sock_path %s exists and is not a socket (mode=0%o); refusing to remove",
+                  cfg->sock_path, sst.st_mode & 07777);
+            close(fd); free(ipc); return NULL;
+        }
+    } else if (errno != ENOENT) {
+        LOG_W("lstat(%s): %s", cfg->sock_path, strerror(errno));
+    }
 
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         LOG_E("bind(%s): %s", cfg->sock_path, strerror(errno));

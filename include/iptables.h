@@ -9,9 +9,10 @@ typedef struct {
     char     iptables_bin[96];
 } wg_iptables_t;
 
-/* Describes the desired FORWARD DROP state: which LAN IPs should be
- * blocked right now. Callers build this list from schedule + DHCP-range
- * batch controls before each reconcile. */
+/* The set of LAN IPs that should be per-host DROPped (permanent blocks
+ * from blocks.json plus any supervisor-triggered device minus any active
+ * grants). Closed-mode dhcp-range blocking is NOT enumerated here — a
+ * single `-i <lan> -j DROP` rule covers that. */
 typedef struct {
     uint32_t *blocked_ips;   /* host-order */
     size_t    n;
@@ -23,23 +24,33 @@ void wg_block_set_free(wg_block_set_t *b);
 void wg_block_set_add (wg_block_set_t *b, uint32_t ip);
 bool wg_block_set_has (const wg_block_set_t *b, uint32_t ip);
 
-/* One-time bootstrap: ensure the two ipset ACCEPT rules sit at FORWARD
- * slots 1 and 2. Idempotent. */
-int iptables_bootstrap(wg_iptables_t *t, const char *ipset_bin_for_match);
-
-/* Reconcile FORWARD DROP rules so they match `desired`:
- *   - add missing DROPs
- *   - remove stale DROPs inside `net_addr/net_mask` that aren't desired
- *   - reinsert the ipset ACCEPT rules at slots 1-2 if missing.
- * `added` / `removed` counts are filled (NULL to skip). */
+/* Reconcile the tail of the FORWARD chain so it matches wgatectl's
+ * desired state.
+ *
+ *   After external DOCKER-* and -i <wan> rules (which we never touch),
+ *   append a contiguous block of rules in this order — every one tagged
+ *   with `-m comment --comment wgatectl`:
+ *
+ *     1. -i <lan> -m set --match-set wgate_allow dst -j ACCEPT
+ *     2. -i <lan> -m set --match-set wgate_allow src -j ACCEPT
+ *     3. -s <static_cidr> -j ACCEPT                   (if static_cidr != NULL/"")
+ *     4. -s <ip>/32 -j DROP  (for each ip in `desired_drops`, sorted)
+ *     5. -i <lan> -j DROP                             (if closed_mode)
+ *     6. -j ACCEPT                                    (catch-all)
+ *
+ *   Any previously-installed wgatectl rule (or legacy rule from before
+ *   the comment tag existed) is removed before the fresh block is
+ *   appended.
+ *
+ * `added` / `removed` receive the number of append / delete actions
+ * that succeeded (pass NULL to skip). Returns 0 on success, -1 on
+ * fatal error (e.g. iptables binary unusable). */
 int iptables_reconcile(wg_iptables_t *t,
+                       const char *lan_iface,
+                       const char *static_cidr,
                        uint32_t net_addr, uint32_t net_mask,
-                       const wg_block_set_t *desired,
+                       const wg_block_set_t *desired_drops,
+                       bool closed_mode,
                        int *added, int *removed);
-
-/* Add or remove a single DROP rule directly (used by /dhcp-range
- * endpoints for immediate feedback — reconcile still catches any drift). */
-int iptables_drop_add   (wg_iptables_t *t, uint32_t ip);
-int iptables_drop_remove(wg_iptables_t *t, uint32_t ip);
 
 #endif

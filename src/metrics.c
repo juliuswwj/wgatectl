@@ -387,6 +387,18 @@ void metrics_emit_control(jsonl_t *jl, int64_t ts_secs,
     json_out_free(&j);
 }
 
+/* --------------------------- iterator ------------------------------- */
+
+void metrics_foreach_bucket(const wg_metrics_t *m,
+                            metrics_bucket_cb_t cb, void *arg) {
+    if (!m || !cb) return;
+    for (size_t i = 0; i < BUCKET_CAP; i++) {
+        const bucket_t *b = &m->buckets[i];
+        if (b->client_ip == 0) continue;
+        cb(b->client_ip, b->domain, b->bytes, b->pkts, arg);
+    }
+}
+
 /* ---------------------------- flush --------------------------------- */
 
 void metrics_flush(wg_metrics_t *m,

@@ -13,10 +13,19 @@ typedef struct {
     int      host_octet_lo;     /* inclusive, default 64 */
     int      host_octet_hi;     /* exclusive, default 240 */
 
+    /* Static-assignment zone: CIDR (e.g. "10.6.6.0/27") that the gateway
+     * exempts from all FORWARD filtering and proactively ARP-binds.  When
+     * empty, there is no static exempt rule and no ARP binding. */
+    char     static_cidr    [32];
+
     /* External state files */
     char     dnsmasq_conf   [256];  /* /etc/dnsmasq.conf */
     char     dnsmasq_leases [256];  /* /var/lib/misc/dnsmasq.leases */
     char     blocks_json    [256];  /* /var/lib/wgatectl/blocks.json */
+    char     schedule_json  [256];  /* /opt/wgatectl/schedule.json */
+    char     supervised_json[256];  /* /opt/wgatectl/supervised.json */
+    char     grants_json    [256];  /* /opt/wgatectl/grants.json */
+    char     triggers_json  [256];  /* /opt/wgatectl/triggers.json */
 
     /* Output */
     char     jsonl_dir      [256];  /* /var/log/wgatectl */
@@ -29,6 +38,7 @@ typedef struct {
     /* Paths to external tools */
     char     iptables_bin   [96];   /* /sbin/iptables */
     char     ipset_bin      [96];   /* /sbin/ipset */
+    char     ip_bin         [96];   /* /sbin/ip  (iproute2) */
 
     int      flush_seconds;         /* default 60 */
 } wg_cfg_t;

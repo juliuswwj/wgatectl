@@ -3,8 +3,10 @@
 *.d
 *.a
 
-# Compiled binary
+# Compiled binaries
 /wgatectl
+/tests/test_schedule
+/tests/test_supervisor
 
 # Reference / third-party material (not part of this project)
 /ref/

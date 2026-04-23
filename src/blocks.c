@@ -6,6 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Cap the persisted block set to keep an API flood from blowing up
+ * memory and serialising into a 100MB JSON. */
+#define BLOCKS_MAX 2048
+
 void blocks_init(wg_blocks_t *b, const char *path) {
     memset(b, 0, sizeof(*b));
     if (path) {
@@ -75,16 +79,23 @@ bool blocks_contains_ip(const wg_blocks_t *b, const wg_leases_t *leases,
 }
 
 int blocks_add(wg_blocks_t *b, const wg_leases_t *leases, const char *key) {
+    if (!key || !*key) return 0;
     char canon[64];
     blocks_canonicalise(leases, key, canon, sizeof(canon));
+    if (!canon[0]) return 0;
     /* already present? */
     for (size_t i = 0; i < b->n; i++) {
         char k[64];
         blocks_canonicalise(leases, b->keys[i], k, sizeof(k));
         if (strcmp(k, canon) == 0) return 0;
     }
+    if (b->n >= BLOCKS_MAX) {
+        LOG_W("blocks: at cap (%d); refusing to add %s", BLOCKS_MAX, canon);
+        return 0;
+    }
     if (b->n == b->cap) {
         size_t ncap = b->cap ? b->cap * 2 : 16;
+        if (ncap > BLOCKS_MAX) ncap = BLOCKS_MAX;
         char **nk = realloc(b->keys, ncap * sizeof(*nk));
         if (!nk) return 0;
         b->keys = nk;
@@ -126,8 +137,13 @@ int blocks_load(wg_blocks_t *b) {
     for (size_t i = 0; i < v->u.arr.n; i++) {
         const json_val_t *iv = &v->u.arr.items[i];
         if (iv->type != JV_STR) continue;
+        if (b->n >= BLOCKS_MAX) {
+            LOG_W("blocks: truncating on-disk list at %d entries", BLOCKS_MAX);
+            break;
+        }
         if (b->n == b->cap) {
             size_t ncap = b->cap ? b->cap * 2 : 16;
+            if (ncap > BLOCKS_MAX) ncap = BLOCKS_MAX;
             char **nk = realloc(b->keys, ncap * sizeof(*nk));
             if (!nk) break;
             b->keys = nk;

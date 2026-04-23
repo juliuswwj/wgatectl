@@ -32,12 +32,18 @@ static void defaults(wg_cfg_t *c) {
     set_str(c->dnsmasq_conf,   sizeof(c->dnsmasq_conf),   "/etc/dnsmasq.conf");
     set_str(c->dnsmasq_leases, sizeof(c->dnsmasq_leases), "/var/lib/misc/dnsmasq.leases");
     set_str(c->blocks_json,    sizeof(c->blocks_json),    "/opt/wgatectl/blocks.json");
+    set_str(c->schedule_json,  sizeof(c->schedule_json),  "/opt/wgatectl/schedule.json");
+    set_str(c->supervised_json,sizeof(c->supervised_json),"/opt/wgatectl/supervised.json");
+    set_str(c->grants_json,    sizeof(c->grants_json),    "/opt/wgatectl/grants.json");
+    set_str(c->triggers_json,  sizeof(c->triggers_json),  "/opt/wgatectl/triggers.json");
     set_str(c->jsonl_dir,      sizeof(c->jsonl_dir),      "/opt/wgatectl");
     c->jsonl_retain_days = 14;
     set_str(c->sock_path,      sizeof(c->sock_path),      "/opt/wgatectl/wgatectl.sock");
     set_str(c->sock_group,     sizeof(c->sock_group),     "wgate");
     set_str(c->iptables_bin,   sizeof(c->iptables_bin),   "/sbin/iptables");
     set_str(c->ipset_bin,      sizeof(c->ipset_bin),      "/sbin/ipset");
+    set_str(c->ip_bin,         sizeof(c->ip_bin),         "/sbin/ip");
+    c->static_cidr[0] = 0;
     c->flush_seconds = 60;
 }
 
@@ -49,12 +55,18 @@ static void apply_kv(wg_cfg_t *c, const char *k, const char *v) {
     else if (!strcmp(k, "WG_DNSMASQ_CONF"))    set_str(c->dnsmasq_conf,   sizeof(c->dnsmasq_conf),   v);
     else if (!strcmp(k, "WG_DNSMASQ_LEASES"))  set_str(c->dnsmasq_leases, sizeof(c->dnsmasq_leases), v);
     else if (!strcmp(k, "WG_BLOCKS_JSON"))     set_str(c->blocks_json,    sizeof(c->blocks_json),    v);
+    else if (!strcmp(k, "WG_SCHEDULE_JSON"))   set_str(c->schedule_json,  sizeof(c->schedule_json),  v);
+    else if (!strcmp(k, "WG_SUPERVISED_JSON")) set_str(c->supervised_json,sizeof(c->supervised_json),v);
+    else if (!strcmp(k, "WG_GRANTS_JSON"))     set_str(c->grants_json,    sizeof(c->grants_json),    v);
+    else if (!strcmp(k, "WG_TRIGGERS_JSON"))   set_str(c->triggers_json,  sizeof(c->triggers_json),  v);
     else if (!strcmp(k, "WG_JSONL_DIR"))       set_str(c->jsonl_dir,      sizeof(c->jsonl_dir),      v);
     else if (!strcmp(k, "WG_JSONL_RETAIN"))    set_int(&c->jsonl_retain_days, v);
     else if (!strcmp(k, "WG_SOCK"))            set_str(c->sock_path,      sizeof(c->sock_path),      v);
     else if (!strcmp(k, "WG_SOCK_GROUP"))      set_str(c->sock_group,     sizeof(c->sock_group),     v);
     else if (!strcmp(k, "WG_IPTABLES_BIN"))    set_str(c->iptables_bin,   sizeof(c->iptables_bin),   v);
     else if (!strcmp(k, "WG_IPSET_BIN"))       set_str(c->ipset_bin,      sizeof(c->ipset_bin),      v);
+    else if (!strcmp(k, "WG_IP_BIN"))          set_str(c->ip_bin,         sizeof(c->ip_bin),         v);
+    else if (!strcmp(k, "WG_STATIC_CIDR"))     set_str(c->static_cidr,    sizeof(c->static_cidr),    v);
     else if (!strcmp(k, "WG_FLUSH_SECONDS"))   set_int(&c->flush_seconds, v);
 }
 
@@ -94,8 +106,11 @@ static void load_env(wg_cfg_t *c) {
     static const char *keys[] = {
         "WG_IFACE", "WG_NETWORK", "WG_HOST_OCTET_LO", "WG_HOST_OCTET_HI",
         "WG_DNSMASQ_CONF", "WG_DNSMASQ_LEASES", "WG_BLOCKS_JSON",
+        "WG_SCHEDULE_JSON", "WG_SUPERVISED_JSON",
+        "WG_GRANTS_JSON", "WG_TRIGGERS_JSON",
         "WG_JSONL_DIR", "WG_JSONL_RETAIN",
-        "WG_SOCK", "WG_SOCK_GROUP", "WG_IPTABLES_BIN", "WG_IPSET_BIN",
+        "WG_SOCK", "WG_SOCK_GROUP",
+        "WG_IPTABLES_BIN", "WG_IPSET_BIN", "WG_IP_BIN", "WG_STATIC_CIDR",
         "WG_FLUSH_SECONDS",
         NULL
     };
@@ -141,6 +156,14 @@ int cfg_load(wg_cfg_t *cfg, const char *conf_path_or_null) {
     }
     set_str(cfg->ipset_bin, sizeof(cfg->ipset_bin), found);
 
-    LOG_I("binaries: iptables=%s ipset=%s", cfg->iptables_bin, cfg->ipset_bin);
+    if (!resolve_bin(cfg->ip_bin, "ip", found, sizeof(found))) {
+        LOG_E("ip binary not found (hint=%s); install iproute2 "
+              "or set WG_IP_BIN", cfg->ip_bin);
+        return -1;
+    }
+    set_str(cfg->ip_bin, sizeof(cfg->ip_bin), found);
+
+    LOG_I("binaries: iptables=%s ipset=%s ip=%s",
+          cfg->iptables_bin, cfg->ipset_bin, cfg->ip_bin);
     return 0;
 }
