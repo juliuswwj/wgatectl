@@ -7,6 +7,8 @@
 /wgatectl
 /tests/test_schedule
 /tests/test_supervisor
+/tests/test_blocks
+/tests/test_dnsmasq_conf
 
 # Reference / third-party material (not part of this project)
 /ref/

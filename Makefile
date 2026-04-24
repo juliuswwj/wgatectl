@@ -37,6 +37,7 @@ SRC := \
   src/ipc.c          \
   src/schedule.c     \
   src/supervisor.c   \
+  src/dnsmasq_conf.c \
   src/json.c
 
 OBJ := $(SRC:.c=.o)
@@ -60,9 +61,10 @@ TEST_CORE_OBJ := \
   src/metrics.o     \
   src/schedule.o    \
   src/supervisor.o  \
+  src/dnsmasq_conf.o \
   src/json.o
 
-TEST_BINS := tests/test_schedule tests/test_supervisor tests/test_blocks
+TEST_BINS := tests/test_schedule tests/test_supervisor tests/test_blocks tests/test_dnsmasq_conf
 
 .PHONY: all clean install asan test
 
@@ -83,6 +85,9 @@ tests/test_supervisor: tests/test_supervisor.c $(TEST_CORE_OBJ)
 tests/test_blocks: tests/test_blocks.c $(TEST_CORE_OBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(TEST_CORE_OBJ) $(LDFLAGS) $(LDLIBS)
 
+tests/test_dnsmasq_conf: tests/test_dnsmasq_conf.c $(TEST_CORE_OBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(TEST_CORE_OBJ) $(LDFLAGS) $(LDLIBS)
+
 asan:
 	$(MAKE) clean
 	$(MAKE) CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -std=c11 -D_GNU_SOURCE $(WARN) $(PCAP_CFLAGS) -Iinclude" \
@@ -93,6 +98,7 @@ test: $(TEST_BINS)
 	tests/test_schedule
 	tests/test_supervisor
 	tests/test_blocks
+	tests/test_dnsmasq_conf
 
 install: $(BIN)
 	install -d $(DESTDIR)$(SBINDIR)

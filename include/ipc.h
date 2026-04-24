@@ -32,6 +32,11 @@ typedef struct {
      * through a debouncer. Cleared by default (pointer-NULL = no-op). */
     void           (*reconcile_request_cb)(void *arg);
     void            *reconcile_cb_arg;
+
+    /* Called after dnsmasq.conf is rewritten by the /hosts/{k}/name
+     * handler. Same debouncing contract as reconcile_request_cb. */
+    void           (*dnsmasq_reload_request_cb)(void *arg);
+    void            *dnsmasq_reload_cb_arg;
 } wg_ipc_app_t;
 
 typedef struct wg_ipc wg_ipc_t;

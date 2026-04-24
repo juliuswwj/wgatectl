@@ -38,6 +38,11 @@ typedef struct {
     char     ipset_bin      [96];   /* /sbin/ipset */
     char     ip_bin         [96];   /* /sbin/ip  (iproute2) */
 
+    /* Shell command that reloads dnsmasq after we rewrite
+     * dnsmasq.conf (default: "systemctl restart dnsmasq"). Run via
+     * /bin/sh -c, coalesced to one invocation per 5 s. */
+    char     dnsmasq_reload_cmd[128];
+
     int      flush_seconds;         /* default 60 */
 
     /* Supervisor tuning. threshold_min / cooldown_min are minutes;

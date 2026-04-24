@@ -326,7 +326,7 @@ wg_sniffer_t *sniffer_open(const wg_sniffer_cfg_t *cfg) {
     pcap_set_timeout(s->pcap, 100);
     pcap_set_immediate_mode(s->pcap, 1);
     pcap_set_buffer_size(s->pcap, 2 * 1024 * 1024);
-    pcap_set_promisc(s->pcap, 1);
+    pcap_set_promisc(s->pcap, 0);
 
     int rc = pcap_activate(s->pcap);
     if (rc < 0) {

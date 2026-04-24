@@ -2,6 +2,12 @@
 #include "log.h"
 #include "util.h"
 
+/* During loading, is_static is used as a transient "came from dhcp-host="
+ * flag so add() can prefer dnsmasq.conf entries over leases-file entries
+ * when both describe the same IP. After both sources are parsed,
+ * leases_reload() rewrites is_static to its public meaning: "IP lies
+ * inside WG_STATIC_CIDR". */
+
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -174,12 +180,28 @@ static void parse_leases_file(wg_leases_t *t, const char *path) {
 
 void leases_reload(wg_leases_t *t,
                    const char  *dnsmasq_conf,
-                   const char  *dnsmasq_leases) {
+                   const char  *dnsmasq_leases,
+                   const char  *static_cidr) {
     leases_free(t);
     if (dnsmasq_conf   && *dnsmasq_conf)   parse_conf(t, dnsmasq_conf);
     if (dnsmasq_leases && *dnsmasq_leases) parse_leases_file(t, dnsmasq_leases);
-    LOG_I("leases: loaded %zu entr%s (dhcp-range %s)",
-          t->n, t->n == 1 ? "y" : "ies",
+
+    /* Recompute is_static by CIDR membership; dhcp-host / leases-file
+     * provenance is not itself enough. */
+    uint32_t cidr_addr = 0, cidr_mask = 0;
+    bool     have_cidr = false;
+    if (static_cidr && *static_cidr) {
+        if (cidr_parse(static_cidr, &cidr_addr, &cidr_mask)) have_cidr = true;
+    }
+    size_t n_static = 0;
+    for (size_t i = 0; i < t->n; i++) {
+        bool s = have_cidr && ip_in_subnet(t->items[i].ip, cidr_addr, cidr_mask);
+        t->items[i].is_static = s;
+        if (s) n_static++;
+    }
+
+    LOG_I("leases: loaded %zu entr%s (%zu static, dhcp-range %s)",
+          t->n, t->n == 1 ? "y" : "ies", n_static,
           t->dhcp_lo ? "yes" : "no");
 }
 

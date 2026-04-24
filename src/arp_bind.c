@@ -208,27 +208,7 @@ void arp_bind_apply(wg_arp_bind_t *ab, const wg_leases_t *leases) {
         n_pins++;
     }
 
-    /* 2) dhcp-host entries outside the CIDR (defensive) */
-    if (leases) {
-        for (size_t i = 0; i < leases->n; i++) {
-            const wg_lease_t *l = &leases->items[i];
-            if (!l->is_static) continue;
-            if (l->ip == ab->self_ip) continue;
-            if (l->ip > lo && l->ip < hi) continue;   /* already included */
-            if (n_pins == cap_pins) {
-                size_t nc = cap_pins ? cap_pins * 2 : 64;
-                pin_t *np = realloc(pins, nc * sizeof(*np));
-                if (!np) break;
-                pins = np;
-                cap_pins = nc;
-            }
-            pins[n_pins].ip = l->ip;
-            mac_buf(l->mac, pins[n_pins].mac);
-            n_pins++;
-        }
-    }
-
-    /* 3) delete stale pins from the previous apply */
+    /* 2) delete stale pins from the previous apply */
     uint32_t *new_ips = NULL;
     size_t    new_n = 0, new_cap = 0;
     for (size_t i = 0; i < n_pins; i++) append_u32(&new_ips, &new_n, &new_cap, pins[i].ip);
@@ -242,7 +222,7 @@ void arp_bind_apply(wg_arp_bind_t *ab, const wg_leases_t *leases) {
         if (!still) neigh_del(ab, old);
     }
 
-    /* 4) install / replace every current pin */
+    /* 3) install / replace every current pin */
     for (size_t i = 0; i < n_pins; i++) {
         neigh_replace(ab, pins[i].ip, pins[i].mac);
     }

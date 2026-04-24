@@ -41,6 +41,8 @@ static void defaults(wg_cfg_t *c) {
     set_str(c->iptables_bin,   sizeof(c->iptables_bin),   "/sbin/iptables");
     set_str(c->ipset_bin,      sizeof(c->ipset_bin),      "/sbin/ipset");
     set_str(c->ip_bin,         sizeof(c->ip_bin),         "/sbin/ip");
+    set_str(c->dnsmasq_reload_cmd, sizeof(c->dnsmasq_reload_cmd),
+            "systemctl restart dnsmasq");
     c->static_cidr[0] = 0;
     c->flush_seconds = 60;
     c->supervised_threshold_min      = 5;
@@ -65,6 +67,7 @@ static void apply_kv(wg_cfg_t *c, const char *k, const char *v) {
     else if (!strcmp(k, "WG_IPTABLES_BIN"))    set_str(c->iptables_bin,   sizeof(c->iptables_bin),   v);
     else if (!strcmp(k, "WG_IPSET_BIN"))       set_str(c->ipset_bin,      sizeof(c->ipset_bin),      v);
     else if (!strcmp(k, "WG_IP_BIN"))          set_str(c->ip_bin,         sizeof(c->ip_bin),         v);
+    else if (!strcmp(k, "WG_DNSMASQ_RELOAD_CMD")) set_str(c->dnsmasq_reload_cmd, sizeof(c->dnsmasq_reload_cmd), v);
     else if (!strcmp(k, "WG_STATIC_CIDR"))     set_str(c->static_cidr,    sizeof(c->static_cidr),    v);
     else if (!strcmp(k, "WG_FLUSH_SECONDS"))   set_int(&c->flush_seconds, v);
     else if (!strcmp(k, "WG_SUPERVISED_THRESHOLD_MIN")) set_int(&c->supervised_threshold_min, v);
@@ -113,6 +116,7 @@ static void load_env(wg_cfg_t *c) {
         "WG_JSONL_DIR", "WG_JSONL_RETAIN",
         "WG_SOCK", "WG_SOCK_GROUP",
         "WG_IPTABLES_BIN", "WG_IPSET_BIN", "WG_IP_BIN", "WG_STATIC_CIDR",
+        "WG_DNSMASQ_RELOAD_CMD",
         "WG_FLUSH_SECONDS",
         "WG_SUPERVISED_THRESHOLD_MIN", "WG_SUPERVISED_COOLDOWN_MIN",
         "WG_SUPERVISED_MIN_BYTES_PER_MIN",

@@ -72,6 +72,11 @@ WG_IPTABLES_BIN=/sbin/iptables
 WG_IPSET_BIN=/sbin/ipset
 WG_IP_BIN=/sbin/ip
 
+# Command (run through /bin/sh -c) that reloads dnsmasq after the
+# /hosts/{k}/name endpoint rewrites dnsmasq.conf. Calls are coalesced
+# to one invocation per 5 s, same debounce window as iptables.
+WG_DNSMASQ_RELOAD_CMD=systemctl restart dnsmasq
+
 # Metrics flush cadence.  The main tick fires every second; this knob
 # controls the JSONL flush period and iptables self-heal reconcile.
 WG_FLUSH_SECONDS=60

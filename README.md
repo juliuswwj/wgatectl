@@ -113,6 +113,7 @@ curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST 'http://x/hosts/KP115/bloc
 curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST 'http://x/hosts/KP115/allow?reason=unblocked-by-mom'
 curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST 'http://x/hosts/alice/allow?minutes=30&reason=homework'
 curl --unix-socket /opt/wgatectl/wgatectl.sock -XDELETE http://x/hosts/alice/allow
+curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST 'http://x/hosts/10.6.6.42/name?name=alice-phone'
 
 curl --unix-socket /opt/wgatectl/wgatectl.sock http://x/schedule | jq .
 curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST http://x/mode/closed
@@ -139,6 +140,7 @@ Routes:
 | POST   | `/hosts/{ip\|name}/block`          | block this device (optional `?reason=`); cleared on next supervised/open entry |
 | POST   | `/hosts/{ip\|name}/allow`          | unblock; with `?minutes=N` or `?until=<epoch>` also install a grant that survives closed mode (optional `?reason=`) |
 | DELETE | `/hosts/{ip\|name}/allow`          | revoke an active grant (does not re-block)              |
+| POST   | `/hosts/{ip\|name\|mac}/name?name=<new>` | set the DHCP-reservation name for this device — rewrites `dnsmasq.conf` + debounced reload |
 | GET    | `/schedule`                       | current mode + base + pending overrides + active grants |
 | POST   | `/schedule/override`              | add one-shot override (JSON body `{at,mode,expires_at,reason}`) |
 | DELETE | `/schedule/override/{id}`         | remove a pending override                               |

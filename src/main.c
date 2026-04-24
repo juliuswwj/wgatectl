@@ -22,6 +22,7 @@
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
 #include <sys/timerfd.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -59,6 +60,12 @@ typedef struct {
     /* Reconcile gate (see RECONCILE_MIN_INTERVAL_S above). */
     int64_t          reconcile_last_s;
     bool             reconcile_pending;
+
+    /* dnsmasq reload gate — same RECONCILE_MIN_INTERVAL_S window, fires
+     * the configured dnsmasq_reload_cmd after dnsmasq.conf is rewritten
+     * by POST /hosts/{k}/name. */
+    int64_t          dnsmasq_reload_last_s;
+    bool             dnsmasq_reload_pending;
 } wg_state_t;
 
 enum { TAG_TIMER = 1, TAG_SIGNAL, TAG_PCAP, TAG_IPC_LISTEN, TAG_IPC_CLIENT };
@@ -154,6 +161,46 @@ static void reconcile_request(wg_state_t *st) {
 }
 
 static void reconcile_request_cb(void *arg) { reconcile_request(arg); }
+
+/* Fire the configured dnsmasq reload command (default "systemctl restart
+ * dnsmasq") via /bin/sh -c so the user can put whatever they need there.
+ * Runs synchronously but waits for the child; the command itself
+ * typically returns in under a second. */
+static void dnsmasq_reload_apply_now(wg_state_t *st) {
+    const char *cmd = st->cfg.dnsmasq_reload_cmd;
+    st->dnsmasq_reload_last_s  = now_wall_s();
+    st->dnsmasq_reload_pending = false;
+    if (!cmd || !*cmd) {
+        LOG_W("dnsmasq reload skipped: WG_DNSMASQ_RELOAD_CMD is empty");
+        return;
+    }
+    pid_t pid = fork();
+    if (pid < 0) { LOG_W("fork: %s", strerror(errno)); return; }
+    if (pid == 0) {
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) { /* EINTR retry */ }
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        LOG_I("dnsmasq reload: `%s` ok", cmd);
+    } else {
+        LOG_W("dnsmasq reload: `%s` failed (status=0x%x)", cmd, status);
+    }
+}
+
+static void dnsmasq_reload_request(wg_state_t *st) {
+    int64_t now = now_wall_s();
+    if (now - st->dnsmasq_reload_last_s >= RECONCILE_MIN_INTERVAL_S) {
+        dnsmasq_reload_apply_now(st);
+    } else {
+        st->dnsmasq_reload_pending = true;
+    }
+}
+
+static void dnsmasq_reload_request_cb(void *arg) {
+    dnsmasq_reload_request(arg);
+}
 
 static void do_minute_flush(wg_state_t *st) {
     int64_t now = now_wall_s();
@@ -255,7 +302,8 @@ static int init_all(wg_state_t *st, const char *conf_override) {
     logger_init(0);
 
     leases_init(&st->leases);
-    leases_reload(&st->leases, st->cfg.dnsmasq_conf, st->cfg.dnsmasq_leases);
+    leases_reload(&st->leases, st->cfg.dnsmasq_conf, st->cfg.dnsmasq_leases,
+                  st->cfg.static_cidr);
 
     arp_bind_init(&st->ab, st->cfg.ip_bin, st->cfg.iface, st->cfg.static_cidr);
     arp_bind_apply(&st->ab, &st->leases);
@@ -309,6 +357,8 @@ static int init_all(wg_state_t *st, const char *conf_override) {
     st->app.ab     = &st->ab;
     st->app.reconcile_request_cb = reconcile_request_cb;
     st->app.reconcile_cb_arg     = st;
+    st->app.dnsmasq_reload_request_cb = dnsmasq_reload_request_cb;
+    st->app.dnsmasq_reload_cb_arg     = st;
 
     st->ipc = ipc_open(&st->cfg, &st->app);
     if (!st->ipc) return -1;
@@ -376,6 +426,11 @@ static void on_timer(wg_state_t *st) {
         reconcile_apply_now(st);
     }
 
+    if (st->dnsmasq_reload_pending &&
+        (now_wall_s() - st->dnsmasq_reload_last_s) >= RECONCILE_MIN_INTERVAL_S) {
+        dnsmasq_reload_apply_now(st);
+    }
+
     int hm;
     now_hm_wday(&hm, NULL);
     if (hm != st->last_flush_minute) {
@@ -390,7 +445,7 @@ static void on_signal(wg_state_t *st) {
         if (si.ssi_signo == SIGHUP) {
             LOG_I("SIGHUP: reloading dnsmasq.conf + schedule + supervised");
             leases_reload(&st->leases, st->cfg.dnsmasq_conf,
-                          st->cfg.dnsmasq_leases);
+                          st->cfg.dnsmasq_leases, st->cfg.static_cidr);
             arp_bind_apply(&st->ab, &st->leases);
             schedule_load(st->sched);
             supervisor_load(st->sup);

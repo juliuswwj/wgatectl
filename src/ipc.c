@@ -1,5 +1,6 @@
 #include "ipc.h"
 #include "arp_bind.h"
+#include "dnsmasq_conf.h"
 #include "json.h"
 #include "log.h"
 #include "metrics.h"
@@ -429,10 +430,104 @@ static void handle_host_allow(wg_ipc_t *ipc, client_t *c, const char *key) {
     free(mstr); free(ustr); free(reason);
 }
 
+/* POST /hosts/<key>/name?name=<new>
+ *   Set a DHCP-reservation name for the device identified by <key>.
+ *   <key> must resolve to a lease with a known MAC (either an existing
+ *   dhcp-host entry or a live DHCP lease). The new name must be valid
+ *   DNS-ish and not already in use by another device. On success we
+ *   rewrite dnsmasq.conf atomically, refresh the in-memory leases +
+ *   ARP pins, and schedule a debounced dnsmasq reload. */
+static void handle_host_name(wg_ipc_t *ipc, client_t *c, const char *key) {
+    wg_ipc_app_t *app = ipc->app;
+    char *newname = query_get(query_string(c), "name");
+    if (!newname || !*newname) {
+        free(newname);
+        respond_simple(c, 400, "name required");
+        return;
+    }
+
+    /* Resolve key → lease. Accept IP, existing name, or MAC text. */
+    const wg_lease_t *l = NULL;
+    uint32_t ip;
+    uint8_t mac_from_key[6];
+    if (ip_parse(key, &ip))             l = leases_by_ip  (app->leases, ip);
+    else if (mac_parse(key, mac_from_key)) {
+        for (size_t i = 0; i < app->leases->n; i++) {
+            if (memcmp(app->leases->items[i].mac, mac_from_key, 6) == 0) {
+                l = &app->leases->items[i]; break;
+            }
+        }
+    } else                              l = leases_by_name(app->leases, key);
+
+    if (!l) {
+        free(newname);
+        respond_simple(c, 404, "unknown host");
+        return;
+    }
+    uint8_t zero[6] = {0};
+    if (memcmp(l->mac, zero, 6) == 0) {
+        free(newname);
+        respond_simple(c, 400, "host has no known MAC");
+        return;
+    }
+
+    /* In-memory uniqueness check: any other lease already using this name? */
+    for (size_t i = 0; i < app->leases->n; i++) {
+        const wg_lease_t *o = &app->leases->items[i];
+        if (memcmp(o->mac, l->mac, 6) == 0) continue;
+        if (o->name[0] && strcmp(o->name, newname) == 0) {
+            free(newname);
+            respond_simple(c, 409, "name already in use");
+            return;
+        }
+    }
+
+    bool changed = false;
+    dnsmasq_name_rc_t rc = dnsmasq_set_host_name(app->cfg->dnsmasq_conf,
+                                                 l->mac, l->ip, newname,
+                                                 &changed);
+    if (rc != DNS_NAME_OK) {
+        const char *msg =
+            rc == DNS_NAME_INVALID   ? "invalid name" :
+            rc == DNS_NAME_DUPLICATE ? "name already in use" :
+            rc == DNS_NAME_NO_MAC    ? "host has no known MAC" :
+                                       "dnsmasq.conf write failed";
+        int status = (rc == DNS_NAME_DUPLICATE) ? 409
+                   : (rc == DNS_NAME_INVALID || rc == DNS_NAME_NO_MAC) ? 400
+                   : 500;
+        free(newname);
+        respond_simple(c, status, msg);
+        return;
+    }
+
+    if (changed) {
+        leases_reload(app->leases, app->cfg->dnsmasq_conf,
+                      app->cfg->dnsmasq_leases, app->cfg->static_cidr);
+        if (app->ab) arp_bind_apply(app->ab, app->leases);
+        if (app->dnsmasq_reload_request_cb)
+            app->dnsmasq_reload_request_cb(app->dnsmasq_reload_cb_arg);
+        char ipbuf[16] = "";
+        if (l->ip) ip_format(l->ip, ipbuf);
+        metrics_emit_control(app->jl, now_wall_s(), newname,
+                             ipbuf[0] ? ipbuf : NULL, "rename", "api");
+    }
+
+    json_out_t j; json_out_init(&j);
+    json_obj_begin(&j);
+    json_kbool(&j, "ok", true);
+    json_kstr (&j, "name", newname);
+    json_kbool(&j, "changed", changed);
+    json_obj_end(&j);
+    respond_json(c, 200, &j);
+    json_out_free(&j);
+    free(newname);
+}
+
 static void handle_host_action(wg_ipc_t *ipc, client_t *c,
                                const char *key, const char *action) {
     if (strcmp(action, "block") == 0) { handle_host_block(ipc, c, key); return; }
     if (strcmp(action, "allow") == 0) { handle_host_allow(ipc, c, key); return; }
+    if (strcmp(action, "name")  == 0) { handle_host_name (ipc, c, key); return; }
     respond_simple(c, 404, "unknown action");
 }
 
@@ -655,7 +750,8 @@ static void handle_metrics_tail(wg_ipc_t *ipc, client_t *c) {
 
 static void handle_reload(wg_ipc_t *ipc, client_t *c) {
     wg_ipc_app_t *app = ipc->app;
-    leases_reload(app->leases, app->cfg->dnsmasq_conf, app->cfg->dnsmasq_leases);
+    leases_reload(app->leases, app->cfg->dnsmasq_conf, app->cfg->dnsmasq_leases,
+                  app->cfg->static_cidr);
     if (app->ab) arp_bind_apply(app->ab, app->leases);
     schedule_load(app->sched);
     supervisor_load(app->sup);
