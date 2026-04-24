@@ -32,6 +32,10 @@ uint64_t now_mono_ns(void);
 /* Wall-clock time in seconds (UTC epoch). */
 int64_t now_wall_s(void);
 
+/* Seconds since the kernel booted (CLOCK_BOOTTIME). Used for /status
+ * uptime and the system-metrics event. */
+int64_t now_boot_s(void);
+
 /* Local-time ISO-8601 with offset, e.g. "2026-04-20T15:43:00-07:00".
  * Buffer must be >= 32 bytes. */
 void now_wall_iso8601(char *buf, size_t cap);

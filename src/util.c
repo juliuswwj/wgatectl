@@ -82,6 +82,12 @@ int64_t now_wall_s(void) {
     return (int64_t)ts.tv_sec;
 }
 
+int64_t now_boot_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_BOOTTIME, &ts);
+    return (int64_t)ts.tv_sec;
+}
+
 static void fmt_iso8601(const struct tm *tm, long gmtoff, char *buf, size_t cap) {
     int sign = gmtoff >= 0 ? 1 : -1;
     long off = gmtoff * sign;

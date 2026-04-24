@@ -55,21 +55,38 @@ int main(void) {
     assert(wday_of(mk(2026,4,24, 12,0)) == 5);  /* Fri */
     assert(wday_of(mk(2026,4,25, 12,0)) == 6);  /* Sat */
 
-    /* Base schedule expectations (all Mon = 2026-04-20 unless noted). */
-    EXPECT_MODE(s, mk(2026,4,20, 6,59),  SCH_MODE_CLOSED);     /* Sun 22:30 closed */
-    EXPECT_MODE(s, mk(2026,4,20, 7,0),   SCH_MODE_SUPERVISED); /* Mon 07:00 */
+    /* Base schedule expectations.
+     * Default bedtimes: Sun/Mon/Wed/Thu 23:00, Tue 23:30, Sat/Sun 00:00. */
+
+    /* Monday (2026-04-20): carries Sun-night closure until 07:00. */
+    EXPECT_MODE(s, mk(2026,4,20, 6,59),  SCH_MODE_CLOSED);     /* still Sun bedtime */
+    EXPECT_MODE(s, mk(2026,4,20, 7,0),   SCH_MODE_SUPERVISED); /* Mon 07:00 wakes */
     EXPECT_MODE(s, mk(2026,4,20, 17,59), SCH_MODE_SUPERVISED);
     EXPECT_MODE(s, mk(2026,4,20, 18,0),  SCH_MODE_OPEN);
-    EXPECT_MODE(s, mk(2026,4,20, 22,29), SCH_MODE_OPEN);
-    EXPECT_MODE(s, mk(2026,4,20, 22,30), SCH_MODE_CLOSED);     /* Mon 22:30 (in 0x1B) */
+    EXPECT_MODE(s, mk(2026,4,20, 22,59), SCH_MODE_OPEN);
+    EXPECT_MODE(s, mk(2026,4,20, 23,0),  SCH_MODE_CLOSED);     /* Mon 23:00 (in 0x1B) */
 
-    /* Tuesday: 22:30 does NOT apply (Tue not in 0x1B); closes at 23:30. */
-    EXPECT_MODE(s, mk(2026,4,21, 22,30), SCH_MODE_OPEN);
+    /* Tuesday (2026-04-21): 23:00 does NOT apply; closes at 23:30. */
+    EXPECT_MODE(s, mk(2026,4,21, 23,0),  SCH_MODE_OPEN);
     EXPECT_MODE(s, mk(2026,4,21, 23,29), SCH_MODE_OPEN);
-    EXPECT_MODE(s, mk(2026,4,21, 23,30), SCH_MODE_CLOSED);     /* Tue 23:30 (in 0x64) */
+    EXPECT_MODE(s, mk(2026,4,21, 23,30), SCH_MODE_CLOSED);     /* Tue 23:30 */
     EXPECT_MODE(s, mk(2026,4,22, 2,0),   SCH_MODE_CLOSED);     /* still Tue-night bedtime */
     EXPECT_MODE(s, mk(2026,4,22, 6,59),  SCH_MODE_CLOSED);
     EXPECT_MODE(s, mk(2026,4,22, 7,0),   SCH_MODE_SUPERVISED); /* Wed 07:00 */
+
+    /* Friday (2026-04-24) → Saturday: Fri has NO bedtime rule, stays open
+     * past 23:00; Sat 00:00 closed triggers midnight. */
+    EXPECT_MODE(s, mk(2026,4,24, 23,0),  SCH_MODE_OPEN);       /* Fri 23:00 still open */
+    EXPECT_MODE(s, mk(2026,4,24, 23,59), SCH_MODE_OPEN);
+    EXPECT_MODE(s, mk(2026,4,25, 0,0),   SCH_MODE_CLOSED);     /* Sat 00:00 closes */
+    EXPECT_MODE(s, mk(2026,4,25, 6,59),  SCH_MODE_CLOSED);
+    EXPECT_MODE(s, mk(2026,4,25, 7,0),   SCH_MODE_SUPERVISED); /* Sat 07:00 */
+
+    /* Saturday night → Sunday: Sat has no bedtime, Sun 00:00 closes. */
+    EXPECT_MODE(s, mk(2026,4,25, 23,0),  SCH_MODE_OPEN);       /* Sat 23:00 open */
+    EXPECT_MODE(s, mk(2026,4,26, 0,0),   SCH_MODE_CLOSED);     /* Sun 00:00 */
+    EXPECT_MODE(s, mk(2026,4,26, 7,0),   SCH_MODE_SUPERVISED);
+    EXPECT_MODE(s, mk(2026,4,26, 23,0),  SCH_MODE_CLOSED);     /* Sun 23:00 bedtime */
 
     /* Overrides: insert Tue 20:00 → closed, expires Tue 21:00. */
     int64_t ov_at  = mk(2026,4,21, 20,0);

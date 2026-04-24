@@ -307,7 +307,6 @@ static int init_all(wg_state_t *st, const char *conf_override) {
     st->app.sched  = st->sched;
     st->app.sup    = st->sup;
     st->app.ab     = &st->ab;
-    st->app.started_mono_ns   = now_mono_ns();
     st->app.reconcile_request_cb = reconcile_request_cb;
     st->app.reconcile_cb_arg     = st;
 

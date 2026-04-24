@@ -26,7 +26,6 @@ typedef struct {
     jsonl_t         *jl;
     wg_schedule_t   *sched;
     wg_supervisor_t *sup;
-    uint64_t         started_mono_ns;
 
     /* Called by IPC handlers after mutating state. The callback MUST NOT
      * run iptables synchronously — it is expected to coalesce requests

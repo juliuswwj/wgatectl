@@ -275,22 +275,27 @@ static void pcap_cb(u_char *user, const struct pcap_pkthdr *hdr,
 
     uint32_t now_s = (uint32_t)hdr->ts.tv_sec;
 
-    if (proto == 17 /* UDP */ && l4cap >= 8) {
+    /* DNS is on UDP port 53 — handle separately (populates reverse map,
+     * triggers ipset add for whitelisted FQDNs) and don't count those
+     * bytes as normal traffic. Everything else (TCP of any flavor plus
+     * non-DNS UDP, including QUIC/HTTP3 on port 443) falls through to
+     * the byte-counting path. */
+    if (proto == 17 /* UDP */) {
+        if (l4cap < 8) return;
         uint16_t sport = (uint16_t)(p[l4off] << 8) | p[l4off + 1];
         uint16_t dport = (uint16_t)(p[l4off + 2] << 8) | p[l4off + 3];
-        uint16_t ulen  = (uint16_t)(p[l4off + 4] << 8) | p[l4off + 5];
-        (void)ulen;
         if (sport == 53 || dport == 53) {
             const uint8_t *dns = p + l4off + 8;
-            size_t dnslen = (l4cap > 8) ? (l4cap - 8) : 0;
+            size_t dnslen = l4cap - 8;
             handle_dns(s, src, dst, dns, dnslen, now_s);
+            return;
         }
+        /* fall through: non-DNS UDP */
+    } else if (proto != 6 /* TCP */) {
         return;
     }
 
-    if (proto != 6 /* TCP */) return;
-
-    /* Count TCP bytes for whichever endpoint is inside the LAN.
+    /* Count bytes for whichever endpoint is inside the LAN.
      * rtset.py only counted download direction (dst in LAN); we do the
      * same so the existing usage-credit heuristic stays calibrated. */
     if (!in_lan(s, dst)) return;
@@ -335,7 +340,7 @@ wg_sniffer_t *sniffer_open(const wg_sniffer_cfg_t *cfg) {
               cfg->iface, pcap_datalink(s->pcap));
 
     struct bpf_program prog;
-    if (pcap_compile(s->pcap, &prog, "(udp port 53) or tcp", 1,
+    if (pcap_compile(s->pcap, &prog, "tcp or udp", 1,
                      PCAP_NETMASK_UNKNOWN) < 0) {
         LOG_E("pcap_compile: %s", pcap_geterr(s->pcap));
         pcap_close(s->pcap);

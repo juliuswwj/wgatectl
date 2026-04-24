@@ -74,8 +74,9 @@ Default weekly base (local time):
 |--------|-------------------|-------------|
 | 07:00  | daily             | supervised  |
 | 18:00  | daily             | open        |
-| 22:30  | Mon/Wed/Thu/Sun   | closed      |
-| 23:30  | Tue/Fri/Sat       | closed      |
+| 23:00  | Sun/Mon/Wed/Thu   | closed      |
+| 23:30  | Tue               | closed      |
+| 00:00  | Sat/Sun           | closed      |
 
 One-shot overrides (`{at, mode, expires_at, reason}`) stack on top of the
 base and are walked as a single sorted timeline — the latest entry with

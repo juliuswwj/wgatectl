@@ -19,8 +19,8 @@ WG_DNSMASQ_LEASES=/var/lib/misc/dnsmasq.leases
 WG_BLOCKS_JSON=/opt/wgatectl/blocks.json
 
 # Schedule state (weekly base + pending one-shot overrides).  If missing,
-# the hard-coded defaults apply (07:00 supervised, 18:00 open, Tue/Fri/Sat
-# 23:30 closed, Mon/Wed/Thu/Sun 22:30 closed).
+# the hard-coded defaults apply (daily 07:00 supervised, 18:00 open;
+# Sun/Mon/Wed/Thu 23:00 closed, Tue 23:30 closed, Sat/Sun 00:00 closed).
 WG_SCHEDULE_JSON=/opt/wgatectl/schedule.json
 
 # Supervised-mode targets: JSON array of domain suffixes (case-insensitive,

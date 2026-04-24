@@ -78,14 +78,19 @@ bool sch_mode_parse(const char *s, sch_mode_t *out) {
 /* Default weekly base (local time):
  *   daily 07:00 → supervised
  *   daily 18:00 → open
- *   Mon/Wed/Thu/Sun 22:30 → closed   (bits 0,1,3,4 = 0x1B)
- *   Tue/Fri/Sat     23:30 → closed   (bits 2,5,6   = 0x64)
+ *   Sun/Mon/Wed/Thu 23:00 → closed   (bits 0,1,3,4 = 0x1B)
+ *   Tue             23:30 → closed   (bit 2        = 0x04)
+ *   Sat/Sun         00:00 → closed   (bits 0,6     = 0x41)
+ *     — this is the "Fri-night" and "Sat-night" midnight bedtime
+ *       (00:00 belongs to the calendar day *starting* at that
+ *       instant, so "Sat 00:00" closes Fri night).
  */
 static const sch_base_t kDefaultBase[] = {
     { 0x7F, 700,  SCH_MODE_SUPERVISED },
     { 0x7F, 1800, SCH_MODE_OPEN       },
-    { 0x1B, 2230, SCH_MODE_CLOSED     },
-    { 0x64, 2330, SCH_MODE_CLOSED     },
+    { 0x1B, 2300, SCH_MODE_CLOSED     },
+    { 0x04, 2330, SCH_MODE_CLOSED     },
+    { 0x41, 0,    SCH_MODE_CLOSED     },
 };
 
 static void apply_defaults(wg_schedule_t *s) {

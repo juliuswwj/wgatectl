@@ -260,8 +260,10 @@ static void handle_status(wg_ipc_t *ipc, client_t *c) {
     json_out_init(&j);
     json_obj_begin(&j);
     json_kbool(&j, "ok", true);
-    uint64_t up_s = (now_mono_ns() - ipc->app->started_mono_ns) / 1000000000ull;
-    json_ku64(&j, "uptime_s", up_s);
+    /* uptime reflects the host kernel, not the daemon process — the
+     * agent cares about box health, not whether wgatectl just
+     * restarted for a config reload. */
+    json_ki64(&j, "uptime_s", now_boot_s());
     json_ki64(&j, "blocked_count", (int)ipc->app->blocks->n);
     json_ki64(&j, "lease_count",   (int)ipc->app->leases->n);
     json_kstr(&j, "iface",   ipc->app->cfg->iface);

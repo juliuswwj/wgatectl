@@ -317,11 +317,7 @@ static void emit_system_event(jsonl_t *jl, int64_t ts, wg_metrics_t *m) {
     }
 
     /* uptime */
-    {
-        struct timespec ts_b;
-        clock_gettime(CLOCK_BOOTTIME, &ts_b);
-        json_ki64(&j, "uptime_s", (int64_t)ts_b.tv_sec);
-    }
+    json_ki64(&j, "uptime_s", now_boot_s());
 
     /* /proc/net/dev */
     {
