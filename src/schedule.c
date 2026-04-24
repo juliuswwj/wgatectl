@@ -565,17 +565,19 @@ static void canonicalise_grant_key(const wg_leases_t *leases, const char *key,
     blocks_canonicalise(leases, key, out, cap);
 }
 
-int schedule_grant_add(wg_schedule_t *s, const wg_leases_t *leases,
-                       const char *key, int minutes, const char *reason) {
-    if (!s || !key || minutes <= 0) return 0;
+int schedule_grant_add_until(wg_schedule_t *s, const wg_leases_t *leases,
+                             const char *key, int64_t until_wall,
+                             const char *reason) {
+    if (!s || !key) return 0;
+    int64_t now = (int64_t)time(NULL);
+    if (until_wall <= now) return 0;
     char canon[64];
     canonicalise_grant_key(leases, key, canon, sizeof(canon));
-    int64_t until = (int64_t)time(NULL) + (int64_t)minutes * 60;
 
     /* update in place if an entry for this key already exists */
     for (size_t i = 0; i < s->n_grants; i++) {
         if (strcmp(s->grants[i].key, canon) == 0) {
-            s->grants[i].until = until;
+            s->grants[i].until = until_wall;
             s->grants[i].reason[0] = 0;
             if (reason) strncpy(s->grants[i].reason, reason,
                                 sizeof(s->grants[i].reason) - 1);
@@ -595,11 +597,18 @@ int schedule_grant_add(wg_schedule_t *s, const wg_leases_t *leases,
     size_t kn = strnlen(canon, sizeof(g->key) - 1);
     memcpy(g->key, canon, kn);
     g->key[kn] = 0;
-    g->until = until;
+    g->until = until_wall;
     if (reason) strncpy(g->reason, reason, sizeof(g->reason) - 1);
     s->dirty_grants = true;
     schedule_save(s);
     return 1;
+}
+
+int schedule_grant_add(wg_schedule_t *s, const wg_leases_t *leases,
+                       const char *key, int minutes, const char *reason) {
+    if (minutes <= 0) return 0;
+    int64_t until = (int64_t)time(NULL) + (int64_t)minutes * 60;
+    return schedule_grant_add_until(s, leases, key, until, reason);
 }
 
 int schedule_grant_remove(wg_schedule_t *s, const wg_leases_t *leases,
@@ -618,6 +627,24 @@ int schedule_grant_remove(wg_schedule_t *s, const wg_leases_t *leases,
         }
     }
     return 0;
+}
+
+size_t schedule_active_grant_ips(const wg_schedule_t *s,
+                                 const wg_leases_t *leases,
+                                 int64_t now_wall,
+                                 uint32_t *out, size_t cap) {
+    if (!s || !out || cap == 0) return 0;
+    size_t n = 0;
+    for (size_t i = 0; i < s->n_grants && n < cap; i++) {
+        if (s->grants[i].until <= now_wall) continue;
+        uint32_t ip;
+        if (!blocks_resolve_ip(leases, s->grants[i].key, &ip)) continue;
+        bool dup = false;
+        for (size_t k = 0; k < n; k++) if (out[k] == ip) { dup = true; break; }
+        if (dup) continue;
+        out[n++] = ip;
+    }
+    return n;
 }
 
 bool schedule_grant_active_ip(const wg_schedule_t *s, const wg_leases_t *leases,
@@ -722,7 +749,7 @@ void schedule_compute_blockset(const wg_schedule_t *s,
     if (blocks) {
         for (size_t i = 0; i < blocks->n; i++) {
             uint32_t ip;
-            if (!blocks_resolve_ip(leases, blocks->keys[i], &ip)) continue;
+            if (!blocks_resolve_ip(leases, blocks->items[i].key, &ip)) continue;
             if (cfg && !ip_in_subnet(ip, cfg->net_addr, cfg->net_mask)) continue;
             if (s && schedule_grant_active_ip(s, leases, ip, now_wall)) continue;
             if (wg_block_set_has(out, ip)) continue;

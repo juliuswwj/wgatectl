@@ -46,10 +46,10 @@ State lives under `/opt/wgatectl/`:
 
 | File              | Contents                                          |
 |-------------------|---------------------------------------------------|
-| `blocks.json`     | permanent per-device blocks set by the API        |
+| `blocks.json`     | per-device blocks (cleared on next supervised/open entry) |
 | `schedule.json`   | weekly base transitions + pending one-shot overrides |
 | `supervised.json` | domain suffixes that count as supervised targets  |
-| `grants.json`     | per-device timed opens (grants)                   |
+| `grants.json`     | per-device timed opens set via `POST /hosts/.../allow?minutes=` |
 | `triggers.json`   | auto-issued 1-hour blocks from the supervisor     |
 
 Alongside the JSONL event files and the Unix socket.  All five JSON files
@@ -81,11 +81,22 @@ One-shot overrides (`{at, mode, expires_at, reason}`) stack on top of the
 base and are walked as a single sorted timeline — the latest entry with
 `at <= now` and `(expires_at == 0 || expires_at > now)` wins.
 
-Per-device **grants** temporarily fully open a device regardless of mode
-(or of `blocks.json`).
+Per-device **block / allow** semantics:
 
-The permanent `/hosts/{key}/block` and `/hosts/{key}/allow` API remains:
-those entries live in `blocks.json` and apply in every mode.
+- `POST /hosts/{key}/block?reason=...` — disable the device. The entry
+  lives in `blocks.json` and is **cleared automatically** the next time
+  the mode transitions into supervised or open (i.e., at the morning
+  wake, or whenever an override/manual mode change lifts closed).
+  There is no permanent block; use a block to mean "pause until
+  naturally reopened".
+- `POST /hosts/{key}/allow?reason=...` — immediately undo the block.
+  No time parameter, pure unblock.
+- `POST /hosts/{key}/allow?minutes=N[&reason=...]` or `?until=<epoch>` —
+  unblock **and** install a timed grant that punches through closed-mode
+  too, i.e., the device stays online for N minutes even if the schedule
+  is in closed. Grants persist in `grants.json`.
+- `DELETE /hosts/{key}/allow` — revoke any active grant for this key
+  (does not re-block; call `/block` if that's what you want).
 
 ## Socket API
 
@@ -97,10 +108,10 @@ Ad-hoc shell:
 ```sh
 curl --unix-socket /opt/wgatectl/wgatectl.sock http://x/status
 curl --unix-socket /opt/wgatectl/wgatectl.sock http://x/hosts | jq .
-curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST http://x/hosts/KP115/block
-curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST http://x/hosts/KP115/allow
-curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST 'http://x/hosts/alice/grant?minutes=30'
-curl --unix-socket /opt/wgatectl/wgatectl.sock -XDELETE http://x/hosts/alice/grant
+curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST 'http://x/hosts/KP115/block?reason=noisy'
+curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST 'http://x/hosts/KP115/allow?reason=unblocked-by-mom'
+curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST 'http://x/hosts/alice/allow?minutes=30&reason=homework'
+curl --unix-socket /opt/wgatectl/wgatectl.sock -XDELETE http://x/hosts/alice/allow
 
 curl --unix-socket /opt/wgatectl/wgatectl.sock http://x/schedule | jq .
 curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST http://x/mode/closed
@@ -123,11 +134,10 @@ Routes:
 | Method | Path                              | Purpose                                                 |
 |--------|-----------------------------------|---------------------------------------------------------|
 | GET    | `/status`                         | liveness, counters, current mode, next transition       |
-| GET    | `/hosts`                          | every lease + any extra blocked keys                    |
-| POST   | `/hosts/{ip\|name}/block`          | add to `blocks.json`, apply DROP rule                   |
-| POST   | `/hosts/{ip\|name}/allow`          | remove from `blocks.json`, drop DROP rule               |
-| POST   | `/hosts/{ip\|name}/grant?minutes=N` | temporarily open this device (optional `reason=`)       |
-| DELETE | `/hosts/{ip\|name}/grant`          | revoke an active grant                                  |
+| GET    | `/hosts`                          | every lease + any extra blocked keys; blocked entries carry `block_reason` / `block_added_at` |
+| POST   | `/hosts/{ip\|name}/block`          | block this device (optional `?reason=`); cleared on next supervised/open entry |
+| POST   | `/hosts/{ip\|name}/allow`          | unblock; with `?minutes=N` or `?until=<epoch>` also install a grant that survives closed mode (optional `?reason=`) |
+| DELETE | `/hosts/{ip\|name}/allow`          | revoke an active grant (does not re-block)              |
 | GET    | `/schedule`                       | current mode + base + pending overrides + active grants |
 | POST   | `/schedule/override`              | add one-shot override (JSON body `{at,mode,expires_at,reason}`) |
 | DELETE | `/schedule/override/{id}`         | remove a pending override                               |
@@ -192,6 +202,7 @@ The tail of FORWARD (after external rules) looks like:
 -A FORWARD -i <lan> -m set --match-set wgate_allow dst -j ACCEPT
 -A FORWARD -i <lan> -m set --match-set wgate_allow src -j ACCEPT
 -A FORWARD -s <WG_STATIC_CIDR> -j ACCEPT                 # (if set)
+-A FORWARD -i <lan> -s 10.6.6.99/32 -j ACCEPT            # active grant, only when mode=closed
 -A FORWARD -s 10.6.6.159/32 -j DROP                      # per-device block
  …
 -A FORWARD -i <lan> -j DROP                              # only when mode=closed

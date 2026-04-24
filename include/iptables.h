@@ -34,8 +34,9 @@ bool wg_block_set_has (const wg_block_set_t *b, uint32_t ip);
  *     1. -i <lan> -m set --match-set wgate_allow dst -j ACCEPT
  *     2. -i <lan> -m set --match-set wgate_allow src -j ACCEPT
  *     3. -s <static_cidr> -j ACCEPT                   (if static_cidr != NULL/"")
- *     4. -s <ip>/32 -j DROP  (for each ip in `desired_drops`, sorted)
- *     5. -i <lan> -j DROP                             (if closed_mode)
+ *     4. -i <lan> -s <ip>/32 -j ACCEPT                (per IP in `grants`, closed mode only)
+ *     5. -s <ip>/32 -j DROP  (for each ip in `desired_drops`, sorted)
+ *     6. -i <lan> -j DROP                             (if closed_mode)
  *
  *   No trailing catch-all ACCEPT: FORWARD's default policy is ACCEPT,
  *   so anything that survives our block is already permitted; adding
@@ -45,6 +46,10 @@ bool wg_block_set_has (const wg_block_set_t *b, uint32_t ip);
  *   the comment tag existed) is removed before the fresh block is
  *   appended.
  *
+ * `grants` is the set of host-order IPs that have an active timed-allow;
+ * in closed mode we emit an explicit per-IP ACCEPT for each (pass NULL
+ * or an empty set otherwise — the caller often does either).
+ *
  * `added` / `removed` receive the number of append / delete actions
  * that succeeded (pass NULL to skip). Returns 0 on success, -1 on
  * fatal error (e.g. iptables binary unusable). */
@@ -53,6 +58,7 @@ int iptables_reconcile(wg_iptables_t *t,
                        const char *static_cidr,
                        uint32_t net_addr, uint32_t net_mask,
                        const wg_block_set_t *desired_drops,
+                       const wg_block_set_t *grants,
                        bool closed_mode,
                        int *added, int *removed);
 

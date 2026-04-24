@@ -62,7 +62,7 @@ TEST_CORE_OBJ := \
   src/supervisor.o  \
   src/json.o
 
-TEST_BINS := tests/test_schedule tests/test_supervisor
+TEST_BINS := tests/test_schedule tests/test_supervisor tests/test_blocks
 
 .PHONY: all clean install asan test
 
@@ -80,6 +80,9 @@ tests/test_schedule: tests/test_schedule.c $(TEST_CORE_OBJ)
 tests/test_supervisor: tests/test_supervisor.c $(TEST_CORE_OBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(TEST_CORE_OBJ) $(LDFLAGS) $(LDLIBS)
 
+tests/test_blocks: tests/test_blocks.c $(TEST_CORE_OBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(TEST_CORE_OBJ) $(LDFLAGS) $(LDLIBS)
+
 asan:
 	$(MAKE) clean
 	$(MAKE) CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -std=c11 -D_GNU_SOURCE $(WARN) $(PCAP_CFLAGS) -Iinclude" \
@@ -89,6 +92,7 @@ asan:
 test: $(TEST_BINS)
 	tests/test_schedule
 	tests/test_supervisor
+	tests/test_blocks
 
 install: $(BIN)
 	install -d $(DESTDIR)$(SBINDIR)

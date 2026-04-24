@@ -289,30 +289,39 @@ static void handle_hosts(wg_ipc_t *ipc, client_t *c) {
         char ipbuf[16], macbuf[18];
         ip_format(l->ip, ipbuf);
         mac_format(l->mac, macbuf);
+        const wg_block_item_t *bi = blocks_find_by_ip(blocks, leases, l->ip);
         json_obj_begin(&j);
         if (l->name[0]) json_kstr(&j, "name", l->name);
         else            json_knull(&j, "name");
         json_kstr (&j, "ip",  ipbuf);
         json_kstr (&j, "mac", macbuf);
         json_kbool(&j, "is_static", l->is_static);
-        json_kbool(&j, "blocked", blocks_contains_ip(blocks, leases, l->ip));
+        json_kbool(&j, "blocked", bi != NULL);
+        if (bi) {
+            if (bi->reason && *bi->reason) json_kstr(&j, "block_reason", bi->reason);
+            if (bi->added_at)              json_ki64(&j, "block_added_at", bi->added_at);
+        }
         json_obj_end(&j);
     }
     /* also surface any blocked keys that don't correspond to a lease
      * (e.g. a raw IP that the agent blocked for a phantom device) */
     for (size_t i = 0; i < blocks->n; i++) {
+        const wg_block_item_t *bi = &blocks->items[i];
+        const char *bkey = bi->key;
         uint32_t ip;
-        bool have_ip = blocks_resolve_ip(leases, blocks->keys[i], &ip);
+        bool have_ip = blocks_resolve_ip(leases, bkey, &ip);
         if (have_ip && leases_by_ip(leases, ip)) continue;
-        if (!have_ip && leases_by_name(leases, blocks->keys[i])) continue;
+        if (!have_ip && leases_by_name(leases, bkey)) continue;
         json_obj_begin(&j);
-        json_kstr (&j, "name", blocks->keys[i]);
+        json_kstr (&j, "name", bkey);
         if (have_ip) {
             char ipbuf[16];
             ip_format(ip, ipbuf);
             json_kstr(&j, "ip", ipbuf);
         }
         json_kbool(&j, "blocked", true);
+        if (bi->reason && *bi->reason) json_kstr(&j, "block_reason", bi->reason);
+        if (bi->added_at)              json_ki64(&j, "block_added_at", bi->added_at);
         json_obj_end(&j);
     }
     json_arr_end(&j);
@@ -335,52 +344,15 @@ static const char *path_after_key(const char *path, const char *prefix,
     return slash + 1;
 }
 
-static void handle_host_action(wg_ipc_t *ipc, client_t *c,
-                               const char *key, const char *action) {
+/* POST /hosts/<key>/block?reason=
+ *   Add <key> to the block list. `reason` lands in blocks.json. The
+ *   entry is cleared automatically on the next supervised/open mode
+ *   transition; there is no permanent block. */
+static void handle_host_block(wg_ipc_t *ipc, client_t *c, const char *key) {
     wg_ipc_app_t *app = ipc->app;
-    bool want_block = (strcmp(action, "block") == 0);
-    bool want_allow = (strcmp(action, "allow") == 0);
-    bool want_grant = (strcmp(action, "grant") == 0);
-    if (!want_block && !want_allow && !want_grant) {
-        respond_simple(c, 404, "unknown action");
-        return;
-    }
-
-    if (want_grant) {
-        char *mstr = query_get(query_string(c), "minutes");
-        int minutes = mstr ? atoi(mstr) : 0;
-        free(mstr);
-        if (minutes <= 0) {
-            respond_simple(c, 400, "minutes must be > 0");
-            return;
-        }
-        char *reason = query_get(query_string(c), "reason");
-        int rc = schedule_grant_add(app->sched, app->leases, key, minutes, reason);
-        free(reason);
-        if (rc) {
-            do_reconcile(app);
-            char ipbuf[16] = "";
-            uint32_t ip;
-            if (blocks_resolve_ip(app->leases, key, &ip)) ip_format(ip, ipbuf);
-            metrics_emit_control(app->jl, now_wall_s(),
-                                 key, ipbuf[0] ? ipbuf : NULL,
-                                 "grant", "api");
-        }
-        json_out_t j; json_out_init(&j);
-        json_obj_begin(&j);
-        json_kbool(&j, "ok", true);
-        json_kstr (&j, "host", key);
-        json_ki64 (&j, "minutes", minutes);
-        json_obj_end(&j);
-        respond_json(c, 200, &j);
-        json_out_free(&j);
-        return;
-    }
-
-    int changed = want_block
-        ? blocks_add   (app->blocks, app->leases, key)
-        : blocks_remove(app->blocks, app->leases, key);
-
+    char *reason = query_get(query_string(c), "reason");
+    int changed = blocks_add(app->blocks, app->leases, key, reason,
+                             now_wall_s());
     if (changed) {
         reconcile_after_change(app);
         char ipbuf[16] = "";
@@ -388,20 +360,83 @@ static void handle_host_action(wg_ipc_t *ipc, client_t *c,
         if (blocks_resolve_ip(app->leases, key, &ip)) ip_format(ip, ipbuf);
         metrics_emit_control(app->jl, now_wall_s(),
                              key, ipbuf[0] ? ipbuf : NULL,
-                             want_block ? "block" : "allow", "api");
+                             "block", "api");
     }
     json_out_t j; json_out_init(&j);
     json_obj_begin(&j);
     json_kbool(&j, "ok", true);
     json_kstr (&j, "host", key);
-    json_kbool(&j, "blocked", want_block);
+    json_kbool(&j, "blocked", true);
     json_kbool(&j, "changed", changed != 0);
+    if (reason && *reason) json_kstr(&j, "reason", reason);
     json_obj_end(&j);
     respond_json(c, 200, &j);
     json_out_free(&j);
+    free(reason);
 }
 
-static void handle_grant_delete(wg_ipc_t *ipc, client_t *c, const char *key) {
+/* POST /hosts/<key>/allow?minutes=&until=&reason=
+ *   Always remove <key> from the block list. If `minutes` or `until`
+ *   is given, additionally install a timed grant that punches through
+ *   a future closed-mode bulk DROP for the duration. */
+static void handle_host_allow(wg_ipc_t *ipc, client_t *c, const char *key) {
+    wg_ipc_app_t *app = ipc->app;
+    const char *qs = query_string(c);
+    char *mstr  = query_get(qs, "minutes");
+    char *ustr  = query_get(qs, "until");
+    char *reason = query_get(qs, "reason");
+
+    int64_t now = now_wall_s();
+    int64_t until = 0;
+    /* `until` wins over `minutes` when both are given */
+    if (ustr) until = strtoll(ustr, NULL, 10);
+    if (until == 0 && mstr) {
+        int minutes = atoi(mstr);
+        if (minutes > 0) until = now + (int64_t)minutes * 60;
+    }
+
+    int block_removed = blocks_remove(app->blocks, app->leases, key);
+    int grant_added   = 0;
+    if (until > now) {
+        grant_added = schedule_grant_add_until(app->sched, app->leases, key,
+                                               until, reason);
+    }
+
+    if (block_removed || grant_added) {
+        if (block_removed) blocks_save(app->blocks);
+        do_reconcile(app);
+        char ipbuf[16] = "";
+        uint32_t ip;
+        if (blocks_resolve_ip(app->leases, key, &ip)) ip_format(ip, ipbuf);
+        metrics_emit_control(app->jl, now, key, ipbuf[0] ? ipbuf : NULL,
+                             grant_added ? "grant" : "allow", "api");
+    }
+
+    json_out_t j; json_out_init(&j);
+    json_obj_begin(&j);
+    json_kbool(&j, "ok", true);
+    json_kstr (&j, "host", key);
+    json_kbool(&j, "blocked", false);
+    json_kbool(&j, "changed", (block_removed || grant_added) != 0);
+    if (until > now) json_ki64(&j, "until", until);
+    if (reason && *reason) json_kstr(&j, "reason", reason);
+    json_obj_end(&j);
+    respond_json(c, 200, &j);
+    json_out_free(&j);
+
+    free(mstr); free(ustr); free(reason);
+}
+
+static void handle_host_action(wg_ipc_t *ipc, client_t *c,
+                               const char *key, const char *action) {
+    if (strcmp(action, "block") == 0) { handle_host_block(ipc, c, key); return; }
+    if (strcmp(action, "allow") == 0) { handle_host_allow(ipc, c, key); return; }
+    respond_simple(c, 404, "unknown action");
+}
+
+/* DELETE /hosts/<key>/allow — revoke any active grant for <key>.
+ * Does not re-block; if you want a block, POST /block. */
+static void handle_allow_delete(wg_ipc_t *ipc, client_t *c, const char *key) {
     wg_ipc_app_t *app = ipc->app;
     int removed = schedule_grant_remove(app->sched, app->leases, key);
     if (removed) {
@@ -668,8 +703,8 @@ static void dispatch(wg_ipc_t *ipc, client_t *c) {
             handle_override_remove(ipc, c, suffix); return;
         }
         if ((action = path_after_key(p, "/hosts/", keybuf, sizeof(keybuf))) != NULL
-            && strcmp(action, "grant") == 0) {
-            handle_grant_delete(ipc, c, keybuf); return;
+            && strcmp(action, "allow") == 0) {
+            handle_allow_delete(ipc, c, keybuf); return;
         }
         if (path_suffix(p, "/supervised/", suffix, sizeof(suffix))) {
             handle_supervised_remove(ipc, c, suffix); return;

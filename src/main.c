@@ -114,14 +114,28 @@ static void sup_observe_cb(uint32_t client_ip, const char *domain,
 static void reconcile_apply_now(wg_state_t *st) {
     int64_t now = now_wall_s();
     sch_mode_t mode = schedule_effective_mode(st->sched, now, NULL);
+
     wg_block_set_t desired;
     schedule_compute_blockset(st->sched, st->sup, &st->blocks, &st->leases,
                               &st->cfg, now, &desired);
+
+    /* Active grants — used in closed mode to punch through the bulk
+     * -i lan DROP. GRANTS_MAX is 512; cap the snapshot accordingly. */
+    wg_block_set_t grants;
+    wg_block_set_init(&grants);
+    {
+        uint32_t gips[512];
+        size_t n = schedule_active_grant_ips(st->sched, &st->leases, now,
+                                             gips, sizeof(gips)/sizeof(*gips));
+        for (size_t i = 0; i < n; i++) wg_block_set_add(&grants, gips[i]);
+    }
+
     iptables_reconcile(&st->ipt,
                        st->cfg.iface, st->cfg.static_cidr,
                        st->cfg.net_addr, st->cfg.net_mask,
-                       &desired, mode == SCH_MODE_CLOSED,
+                       &desired, &grants, mode == SCH_MODE_CLOSED,
                        NULL, NULL);
+    wg_block_set_free(&grants);
     wg_block_set_free(&desired);
     st->reconcile_last_s  = now;
     st->reconcile_pending = false;
@@ -172,12 +186,34 @@ static void do_minute_flush(wg_state_t *st) {
 
     jsonl_sync(st->jl);
 
-    /* emit a control event when the mode transitions */
+    /* emit a control event when the mode transitions, and on entering
+     * a permissive mode (supervised / open) auto-clear the block list
+     * so the user doesn't have to hand-allow each device every morning. */
     if (!st->have_last_mode || mode != st->last_mode) {
         if (st->have_last_mode) {
             metrics_emit_control(st->jl, now, "dhcp-range", NULL,
                                  sch_mode_name(mode), "schedule");
         }
+
+        bool entering_permissive =
+            st->have_last_mode &&
+            (mode == SCH_MODE_SUPERVISED || mode == SCH_MODE_OPEN);
+        if (entering_permissive && st->blocks.n > 0) {
+            for (size_t i = 0; i < st->blocks.n; i++) {
+                const wg_block_item_t *it = &st->blocks.items[i];
+                uint32_t ip;
+                char ipbuf[16] = "";
+                if (blocks_resolve_ip(&st->leases, it->key, &ip))
+                    ip_format(ip, ipbuf);
+                metrics_emit_control(st->jl, now, it->key,
+                                     ipbuf[0] ? ipbuf : NULL,
+                                     "allow", "auto-open");
+            }
+            blocks_clear(&st->blocks);
+            blocks_save(&st->blocks);
+            reconcile_request(st);
+        }
+
         st->last_mode      = mode;
         st->have_last_mode = true;
     }

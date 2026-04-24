@@ -53,11 +53,26 @@ int  schedule_override_remove(wg_schedule_t *s, const char *id);
  * on add/update, 0 on no-op. */
 int  schedule_grant_add(wg_schedule_t *s, const wg_leases_t *leases,
                         const char *key, int minutes, const char *reason);
+
+/* Same as schedule_grant_add but takes the absolute wall-clock expiry
+ * instead of a minutes duration. until_wall must be > now_wall; callers
+ * pre-validate. */
+int  schedule_grant_add_until(wg_schedule_t *s, const wg_leases_t *leases,
+                              const char *key, int64_t until_wall,
+                              const char *reason);
+
 int  schedule_grant_remove(wg_schedule_t *s, const wg_leases_t *leases,
                            const char *key);
 bool schedule_grant_active_ip(const wg_schedule_t *s,
                               const wg_leases_t *leases,
                               uint32_t ip, int64_t now_wall);
+
+/* Enumerate host-order IPs with an active grant at now_wall into out.
+ * Writes up to cap entries; returns the count actually written. */
+size_t schedule_active_grant_ips(const wg_schedule_t *s,
+                                 const wg_leases_t *leases,
+                                 int64_t now_wall,
+                                 uint32_t *out, size_t cap);
 
 /* Dump the current state for GET /schedule. */
 void schedule_dump_json(const wg_schedule_t *s, int64_t now_wall,

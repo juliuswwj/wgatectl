@@ -99,6 +99,17 @@ int main(void) {
     assert(schedule_grant_active_ip(s, &leases, 0x0A060663, now) == true);  /* 10.6.6.99 */
     assert(schedule_grant_active_ip(s, &leases, 0x0A060664, now) == false); /* 10.6.6.100 */
 
+    /* grant_add_until with absolute expiry: past time rejects, future accepts. */
+    assert(schedule_grant_add_until(s, &leases, "10.6.6.77", 1, NULL) == 0);
+    int64_t future = (int64_t)time(NULL) + 3600;
+    assert(schedule_grant_add_until(s, &leases, "10.6.6.77", future, "until") == 1);
+
+    /* active_grant_ips enumerates active grants; count >= 2 (our two). */
+    uint32_t ips[16];
+    size_t k = schedule_active_grant_ips(s, &leases, (int64_t)time(NULL),
+                                         ips, sizeof(ips)/sizeof(*ips));
+    assert(k >= 2);
+
     schedule_free(s);
     printf("OK test_schedule\n");
     return 0;

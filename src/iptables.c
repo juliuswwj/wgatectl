@@ -206,6 +206,7 @@ int iptables_reconcile(wg_iptables_t *t,
                        const char *static_cidr,
                        uint32_t net_addr, uint32_t net_mask,
                        const wg_block_set_t *desired,
+                       const wg_block_set_t *grants,
                        bool closed_mode,
                        int *added, int *removed) {
     const char *bin = t->iptables_bin;
@@ -271,7 +272,29 @@ int iptables_reconcile(wg_iptables_t *t,
         append_tagged(bin, r3, sizeof(r3)/sizeof(*r3), &na);
     }
 
-    /* rule 4: per-IP drops, sorted for determinism */
+    /* rule 4: per-IP ACCEPTs for active grants, only useful in closed
+     * mode where rule 6 would otherwise drop everything. In non-closed
+     * mode grants are already honored by not being listed in `desired`,
+     * so this rule adds no value there. */
+    if (closed_mode && grants && grants->n && lan_iface && *lan_iface) {
+        uint32_t *sorted = malloc(grants->n * sizeof(*sorted));
+        if (sorted) {
+            memcpy(sorted, grants->blocked_ips, grants->n * sizeof(*sorted));
+            qsort(sorted, grants->n, sizeof(*sorted), cmp_u32);
+            for (size_t i = 0; i < grants->n; i++) {
+                uint32_t ip = sorted[i];
+                if (!ip_in_subnet(ip, net_addr, net_mask)) continue;
+                char ipbuf[20], ip_cidr[24];
+                ip_format(ip, ipbuf);
+                snprintf(ip_cidr, sizeof(ip_cidr), "%s/32", ipbuf);
+                const char *r4g[] = { "-i", lan_iface, "-s", ip_cidr, "-j", "ACCEPT" };
+                append_tagged(bin, r4g, sizeof(r4g)/sizeof(*r4g), &na);
+            }
+            free(sorted);
+        }
+    }
+
+    /* rule 5: per-IP drops, sorted for determinism */
     if (desired && desired->n) {
         uint32_t *sorted = malloc(desired->n * sizeof(*sorted));
         if (sorted) {
@@ -291,10 +314,10 @@ int iptables_reconcile(wg_iptables_t *t,
         }
     }
 
-    /* rule 5: bulk -i lan DROP, only in closed mode */
+    /* rule 6: bulk -i lan DROP, only in closed mode */
     if (closed_mode && lan_iface && *lan_iface) {
-        const char *r5[] = { "-i", lan_iface, "-j", "DROP" };
-        append_tagged(bin, r5, sizeof(r5)/sizeof(*r5), &na);
+        const char *r6[] = { "-i", lan_iface, "-j", "DROP" };
+        append_tagged(bin, r6, sizeof(r6)/sizeof(*r6), &na);
     }
     /* No trailing catch-all ACCEPT: FORWARD's policy is ACCEPT by
      * default, so anything that falls off the end is already allowed.
