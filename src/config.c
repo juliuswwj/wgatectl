@@ -29,11 +29,10 @@ static void defaults(wg_cfg_t *c) {
     set_str(c->network_cidr,   sizeof(c->network_cidr),   "10.6.6.0/24");
     set_str(c->dnsmasq_conf,   sizeof(c->dnsmasq_conf),   "/etc/dnsmasq.conf");
     set_str(c->dnsmasq_leases, sizeof(c->dnsmasq_leases), "/var/lib/misc/dnsmasq.leases");
-    set_str(c->blocks_json,    sizeof(c->blocks_json),    "/opt/wgatectl/blocks.json");
     set_str(c->schedule_json,  sizeof(c->schedule_json),  "/opt/wgatectl/schedule.json");
+    set_str(c->filterd_json,   sizeof(c->filterd_json),   "/opt/wgatectl/filterd.json");
+    set_str(c->pins_json,      sizeof(c->pins_json),      "/opt/wgatectl/pins.json");
     set_str(c->supervised_json,sizeof(c->supervised_json),"/opt/wgatectl/supervised.json");
-    set_str(c->grants_json,    sizeof(c->grants_json),    "/opt/wgatectl/grants.json");
-    set_str(c->triggers_json,  sizeof(c->triggers_json),  "/opt/wgatectl/triggers.json");
     set_str(c->jsonl_dir,      sizeof(c->jsonl_dir),      "/opt/wgatectl");
     c->jsonl_retain_days = 14;
     set_str(c->sock_path,      sizeof(c->sock_path),      "/opt/wgatectl/wgatectl.sock");
@@ -45,9 +44,6 @@ static void defaults(wg_cfg_t *c) {
             "systemctl restart dnsmasq");
     c->static_cidr[0] = 0;
     c->flush_seconds = 60;
-    c->supervised_threshold_min      = 5;
-    c->supervised_cooldown_min       = 60;
-    c->supervised_min_bytes_per_min  = 32 * 1024;   /* 32 KiB / min */
 }
 
 static void apply_kv(wg_cfg_t *c, const char *k, const char *v) {
@@ -55,11 +51,10 @@ static void apply_kv(wg_cfg_t *c, const char *k, const char *v) {
     else if (!strcmp(k, "WG_NETWORK"))         set_str(c->network_cidr,   sizeof(c->network_cidr),   v);
     else if (!strcmp(k, "WG_DNSMASQ_CONF"))    set_str(c->dnsmasq_conf,   sizeof(c->dnsmasq_conf),   v);
     else if (!strcmp(k, "WG_DNSMASQ_LEASES"))  set_str(c->dnsmasq_leases, sizeof(c->dnsmasq_leases), v);
-    else if (!strcmp(k, "WG_BLOCKS_JSON"))     set_str(c->blocks_json,    sizeof(c->blocks_json),    v);
     else if (!strcmp(k, "WG_SCHEDULE_JSON"))   set_str(c->schedule_json,  sizeof(c->schedule_json),  v);
+    else if (!strcmp(k, "WG_FILTERD_JSON"))    set_str(c->filterd_json,   sizeof(c->filterd_json),   v);
+    else if (!strcmp(k, "WG_PINS_JSON"))       set_str(c->pins_json,      sizeof(c->pins_json),      v);
     else if (!strcmp(k, "WG_SUPERVISED_JSON")) set_str(c->supervised_json,sizeof(c->supervised_json),v);
-    else if (!strcmp(k, "WG_GRANTS_JSON"))     set_str(c->grants_json,    sizeof(c->grants_json),    v);
-    else if (!strcmp(k, "WG_TRIGGERS_JSON"))   set_str(c->triggers_json,  sizeof(c->triggers_json),  v);
     else if (!strcmp(k, "WG_JSONL_DIR"))       set_str(c->jsonl_dir,      sizeof(c->jsonl_dir),      v);
     else if (!strcmp(k, "WG_JSONL_RETAIN"))    set_int(&c->jsonl_retain_days, v);
     else if (!strcmp(k, "WG_SOCK"))            set_str(c->sock_path,      sizeof(c->sock_path),      v);
@@ -71,9 +66,6 @@ static void apply_kv(wg_cfg_t *c, const char *k, const char *v) {
     else if (!strcmp(k, "WG_PVE_MAC"))         set_str(c->pve_mac,        sizeof(c->pve_mac),        v);
     else if (!strcmp(k, "WG_STATIC_CIDR"))     set_str(c->static_cidr,    sizeof(c->static_cidr),    v);
     else if (!strcmp(k, "WG_FLUSH_SECONDS"))   set_int(&c->flush_seconds, v);
-    else if (!strcmp(k, "WG_SUPERVISED_THRESHOLD_MIN")) set_int(&c->supervised_threshold_min, v);
-    else if (!strcmp(k, "WG_SUPERVISED_COOLDOWN_MIN"))  set_int(&c->supervised_cooldown_min,  v);
-    else if (!strcmp(k, "WG_SUPERVISED_MIN_BYTES_PER_MIN")) set_int(&c->supervised_min_bytes_per_min, v);
 }
 
 static char *trim(char *s) {
@@ -111,17 +103,15 @@ static int load_file(wg_cfg_t *c, const char *path) {
 static void load_env(wg_cfg_t *c) {
     static const char *keys[] = {
         "WG_IFACE", "WG_NETWORK",
-        "WG_DNSMASQ_CONF", "WG_DNSMASQ_LEASES", "WG_BLOCKS_JSON",
-        "WG_SCHEDULE_JSON", "WG_SUPERVISED_JSON",
-        "WG_GRANTS_JSON", "WG_TRIGGERS_JSON",
+        "WG_DNSMASQ_CONF", "WG_DNSMASQ_LEASES",
+        "WG_SCHEDULE_JSON", "WG_FILTERD_JSON", "WG_PINS_JSON",
+        "WG_SUPERVISED_JSON",
         "WG_JSONL_DIR", "WG_JSONL_RETAIN",
         "WG_SOCK", "WG_SOCK_GROUP",
         "WG_IPTABLES_BIN", "WG_IPSET_BIN", "WG_IP_BIN", "WG_STATIC_CIDR",
         "WG_DNSMASQ_RELOAD_CMD",
         "WG_PVE_MAC",
         "WG_FLUSH_SECONDS",
-        "WG_SUPERVISED_THRESHOLD_MIN", "WG_SUPERVISED_COOLDOWN_MIN",
-        "WG_SUPERVISED_MIN_BYTES_PER_MIN",
         NULL
     };
     for (int i = 0; keys[i]; i++) {
@@ -145,11 +135,6 @@ int cfg_load(wg_cfg_t *cfg, const char *conf_path_or_null) {
     }
     if (cfg->flush_seconds < 10)  cfg->flush_seconds = 10;
     if (cfg->flush_seconds > 600) cfg->flush_seconds = 600;
-    if (cfg->supervised_threshold_min < 1)   cfg->supervised_threshold_min = 1;
-    if (cfg->supervised_threshold_min > 120) cfg->supervised_threshold_min = 120;
-    if (cfg->supervised_cooldown_min  < 1)        cfg->supervised_cooldown_min = 1;
-    if (cfg->supervised_cooldown_min  > 24 * 60)  cfg->supervised_cooldown_min = 24 * 60;
-    if (cfg->supervised_min_bytes_per_min < 0)    cfg->supervised_min_bytes_per_min = 0;
 
     /* Resolve external binaries. We search standard locations if the
      * configured path doesn't exist, so users don't hit cryptic rc=127

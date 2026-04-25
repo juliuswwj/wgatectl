@@ -1,6 +1,7 @@
 #ifndef WGATECTL_SNIFFER_H
 #define WGATECTL_SNIFFER_H
 
+#include "filterd.h"
 #include "ipset_mgr.h"
 #include "metrics.h"
 
@@ -15,6 +16,7 @@ typedef struct {
     uint32_t       net_mask;
     ipset_mgr_t   *ipset;
     wg_metrics_t  *metrics;
+    wg_filterd_t  *filterd;
 } wg_sniffer_cfg_t;
 
 wg_sniffer_t *sniffer_open(const wg_sniffer_cfg_t *cfg);

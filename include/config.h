@@ -19,11 +19,10 @@ typedef struct {
     /* External state files */
     char     dnsmasq_conf   [256];  /* /etc/dnsmasq.conf */
     char     dnsmasq_leases [256];  /* /var/lib/misc/dnsmasq.leases */
-    char     blocks_json    [256];  /* /var/lib/wgatectl/blocks.json */
     char     schedule_json  [256];  /* /opt/wgatectl/schedule.json */
-    char     supervised_json[256];  /* /opt/wgatectl/supervised.json */
-    char     grants_json    [256];  /* /opt/wgatectl/grants.json */
-    char     triggers_json  [256];  /* /opt/wgatectl/triggers.json */
+    char     filterd_json   [256];  /* /opt/wgatectl/filterd.json */
+    char     pins_json      [256];  /* /opt/wgatectl/pins.json */
+    char     supervised_json[256];  /* /opt/wgatectl/supervised.json (legacy, one-shot import) */
 
     /* Output */
     char     jsonl_dir      [256];  /* /var/log/wgatectl */
@@ -49,15 +48,6 @@ typedef struct {
     char     pve_mac[18];
 
     int      flush_seconds;         /* default 60 */
-
-    /* Supervisor tuning. threshold_min / cooldown_min are minutes;
-     * min_bytes_per_min is the minimum aggregate matched-domain traffic
-     * per minute (summed across all matched targets) that counts as
-     * "active" for that minute — keepalives/background heartbeats stay
-     * under this and don't accrue toward the trigger. */
-    int      supervised_threshold_min;
-    int      supervised_cooldown_min;
-    int      supervised_min_bytes_per_min;
 } wg_cfg_t;
 
 /* Populate cfg with compile-time defaults, overlay /etc/wgatectl.conf (if

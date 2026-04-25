@@ -41,7 +41,7 @@ int main(void) {
     setenv("TZ", "Asia/Shanghai", 1);
     tzset();
 
-    wg_schedule_t *s = schedule_new(NULL, NULL);
+    wg_schedule_t *s = schedule_new(NULL);
     assert(s);
     schedule_load(s);                /* applies hard-coded defaults */
 
@@ -60,8 +60,8 @@ int main(void) {
 
     /* Monday (2026-04-20): carries Sun-night closure until 07:00. */
     EXPECT_MODE(s, mk(2026,4,20, 6,59),  SCH_MODE_CLOSED);     /* still Sun bedtime */
-    EXPECT_MODE(s, mk(2026,4,20, 7,0),   SCH_MODE_SUPERVISED); /* Mon 07:00 wakes */
-    EXPECT_MODE(s, mk(2026,4,20, 17,59), SCH_MODE_SUPERVISED);
+    EXPECT_MODE(s, mk(2026,4,20, 7,0),   SCH_MODE_FILTERED); /* Mon 07:00 wakes */
+    EXPECT_MODE(s, mk(2026,4,20, 17,59), SCH_MODE_FILTERED);
     EXPECT_MODE(s, mk(2026,4,20, 18,0),  SCH_MODE_OPEN);
     EXPECT_MODE(s, mk(2026,4,20, 22,59), SCH_MODE_OPEN);
     EXPECT_MODE(s, mk(2026,4,20, 23,0),  SCH_MODE_CLOSED);     /* Mon 23:00 (in 0x1B) */
@@ -72,7 +72,7 @@ int main(void) {
     EXPECT_MODE(s, mk(2026,4,21, 23,30), SCH_MODE_CLOSED);     /* Tue 23:30 */
     EXPECT_MODE(s, mk(2026,4,22, 2,0),   SCH_MODE_CLOSED);     /* still Tue-night bedtime */
     EXPECT_MODE(s, mk(2026,4,22, 6,59),  SCH_MODE_CLOSED);
-    EXPECT_MODE(s, mk(2026,4,22, 7,0),   SCH_MODE_SUPERVISED); /* Wed 07:00 */
+    EXPECT_MODE(s, mk(2026,4,22, 7,0),   SCH_MODE_FILTERED); /* Wed 07:00 */
 
     /* Friday (2026-04-24) → Saturday: Fri has NO bedtime rule, stays open
      * past 23:00; Sat 00:00 closed triggers midnight. */
@@ -80,12 +80,15 @@ int main(void) {
     EXPECT_MODE(s, mk(2026,4,24, 23,59), SCH_MODE_OPEN);
     EXPECT_MODE(s, mk(2026,4,25, 0,0),   SCH_MODE_CLOSED);     /* Sat 00:00 closes */
     EXPECT_MODE(s, mk(2026,4,25, 6,59),  SCH_MODE_CLOSED);
-    EXPECT_MODE(s, mk(2026,4,25, 7,0),   SCH_MODE_SUPERVISED); /* Sat 07:00 */
+    EXPECT_MODE(s, mk(2026,4,25, 7,0),   SCH_MODE_FILTERED);   /* Sat 07:00 */
+    EXPECT_MODE(s, mk(2026,4,25, 8,59),  SCH_MODE_FILTERED);   /* still filtered */
+    EXPECT_MODE(s, mk(2026,4,25, 9,0),   SCH_MODE_OPEN);       /* Sat 09:00 weekend open */
 
     /* Saturday night → Sunday: Sat has no bedtime, Sun 00:00 closes. */
     EXPECT_MODE(s, mk(2026,4,25, 23,0),  SCH_MODE_OPEN);       /* Sat 23:00 open */
     EXPECT_MODE(s, mk(2026,4,26, 0,0),   SCH_MODE_CLOSED);     /* Sun 00:00 */
-    EXPECT_MODE(s, mk(2026,4,26, 7,0),   SCH_MODE_SUPERVISED);
+    EXPECT_MODE(s, mk(2026,4,26, 7,0),   SCH_MODE_FILTERED);
+    EXPECT_MODE(s, mk(2026,4,26, 9,0),   SCH_MODE_OPEN);       /* Sun 09:00 weekend open */
     EXPECT_MODE(s, mk(2026,4,26, 23,0),  SCH_MODE_CLOSED);     /* Sun 23:00 bedtime */
 
     /* Overrides: insert Tue 20:00 → closed, expires Tue 21:00. */
@@ -106,26 +109,6 @@ int main(void) {
     schedule_tick(s, mk(2026,4,21, 22,0));
     rc = schedule_override_remove(s, id);
     assert(rc == 0 || rc == 1);   /* already gone is fine */
-
-    /* Grants: add a 5-minute grant for a raw IP. */
-    wg_leases_t leases;
-    memset(&leases, 0, sizeof(leases));
-    rc = schedule_grant_add(s, &leases, "10.6.6.99", 5, "homework");
-    assert(rc == 1);
-    int64_t now = mk(2026,4,20, 12,0);
-    assert(schedule_grant_active_ip(s, &leases, 0x0A060663, now) == true);  /* 10.6.6.99 */
-    assert(schedule_grant_active_ip(s, &leases, 0x0A060664, now) == false); /* 10.6.6.100 */
-
-    /* grant_add_until with absolute expiry: past time rejects, future accepts. */
-    assert(schedule_grant_add_until(s, &leases, "10.6.6.77", 1, NULL) == 0);
-    int64_t future = (int64_t)time(NULL) + 3600;
-    assert(schedule_grant_add_until(s, &leases, "10.6.6.77", future, "until") == 1);
-
-    /* active_grant_ips enumerates active grants; count >= 2 (our two). */
-    uint32_t ips[16];
-    size_t k = schedule_active_grant_ips(s, &leases, (int64_t)time(NULL),
-                                         ips, sizeof(ips)/sizeof(*ips));
-    assert(k >= 2);
 
     schedule_free(s);
     printf("OK test_schedule\n");

@@ -1,6 +1,6 @@
 #include "arp_bind.h"
-#include "blocks.h"
 #include "config.h"
+#include "filterd.h"
 #include "ipc.h"
 #include "ipset_mgr.h"
 #include "iptables.h"
@@ -8,9 +8,9 @@
 #include "leases.h"
 #include "log.h"
 #include "metrics.h"
+#include "pins.h"
 #include "schedule.h"
 #include "sniffer.h"
-#include "supervisor.h"
 #include "util.h"
 
 #include <errno.h>
@@ -37,14 +37,14 @@
 typedef struct {
     wg_cfg_t         cfg;
     wg_leases_t      leases;
-    wg_blocks_t      blocks;
     wg_iptables_t    ipt;
     wg_arp_bind_t    ab;
     ipset_mgr_t     *ipset;
     wg_metrics_t    *metrics;
     jsonl_t         *jl;
     wg_schedule_t   *sched;
-    wg_supervisor_t *sup;
+    wg_filterd_t    *filterd;
+    wg_pins_t       *pins;
     wg_sniffer_t    *sniffer;
     wg_ipc_t        *ipc;
     wg_ipc_app_t     app;
@@ -117,13 +117,6 @@ static int ep_add(int epfd, int fd, uint32_t events, void *ptr) {
     return epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
 }
 
-static void sup_observe_cb(uint32_t client_ip, const char *domain,
-                           uint64_t bytes, uint32_t pkts, void *arg) {
-    (void)pkts;
-    wg_state_t *st = arg;
-    supervisor_observe(st->sup, client_ip, domain, bytes);
-}
-
 /* Actually run iptables reconcile. Called either directly from code paths
  * where immediate application is required (startup), or from the gate
  * below when the debounce window has elapsed. */
@@ -131,28 +124,17 @@ static void reconcile_apply_now(wg_state_t *st) {
     int64_t now = now_wall_s();
     sch_mode_t mode = schedule_effective_mode(st->sched, now, NULL);
 
-    wg_block_set_t desired;
-    schedule_compute_blockset(st->sched, st->sup, &st->blocks, &st->leases,
-                              &st->cfg, now, &desired);
-
-    /* Active grants — used in closed mode to punch through the bulk
-     * -i lan DROP. GRANTS_MAX is 512; cap the snapshot accordingly. */
-    wg_block_set_t grants;
-    wg_block_set_init(&grants);
-    {
-        uint32_t gips[512];
-        size_t n = schedule_active_grant_ips(st->sched, &st->leases, now,
-                                             gips, sizeof(gips)/sizeof(*gips));
-        for (size_t i = 0; i < n; i++) wg_block_set_add(&grants, gips[i]);
-    }
+    /* refresh the wgate_pin_* ipsets to match current pin state, then
+     * stamp the FORWARD chain. iptables rules reference the ipsets by
+     * name so this can run on every reconcile without churning the
+     * kernel rule table. */
+    pins_dump_to_ipsets(st->pins, &st->leases, now);
 
     iptables_reconcile(&st->ipt,
                        st->cfg.iface, st->cfg.static_cidr,
                        st->cfg.net_addr, st->cfg.net_mask,
-                       &desired, &grants, mode == SCH_MODE_CLOSED,
-                       NULL, NULL);
-    wg_block_set_free(&grants);
-    wg_block_set_free(&desired);
+                       mode == SCH_MODE_CLOSED,
+                       mode == SCH_MODE_FILTERED);
     st->reconcile_last_s  = now;
     st->reconcile_pending = false;
 }
@@ -258,69 +240,32 @@ static void do_minute_flush(wg_state_t *st) {
      * any decision based on `leases` runs this minute */
     check_dnsmasq_files(st);
 
-    /* drop expired overrides/grants before evaluation */
+    /* drop expired overrides/pins before evaluation */
     schedule_tick(st->sched, now);
+    pins_tick(st->pins, now);
 
     /* evaluate the mode we're in for this minute */
     sch_mode_t mode = schedule_effective_mode(st->sched, now, NULL);
 
-    /* supervisor: observe per-bucket traffic (only in supervised mode),
-     * then commit the minute; outside supervised mode, drop any stale
-     * matched state so the counter doesn't linger across mode swaps. */
-    if (mode == SCH_MODE_SUPERVISED) {
-        metrics_foreach_bucket(st->metrics, sup_observe_cb, st);
-        supervisor_commit_minute(st->sup, &st->leases, st->jl, now);
-    } else {
-        supervisor_drop_minute(st->sup);
-    }
-
-    /* expire any supervised-mode 1-hour blocks whose clock ran out */
-    supervisor_tick(st->sup, &st->leases, now);
+    /* drain any DNS-observed filterd IPs into the kernel ipset (at most
+     * once per minute by design) */
+    filterd_flush(st->filterd, now);
 
     /* Go through the gate so that a minute tick that coincides with an
      * API burst still only produces one iptables pass. */
     reconcile_request(st);
 
     /* flush the per-minute traffic aggregator */
-    metrics_flush(st->metrics, st->jl, &st->leases, &st->blocks, now);
+    metrics_flush(st->metrics, st->jl, &st->leases, now);
 
     jsonl_sync(st->jl);
 
-    /* emit a control event when the mode transitions, and on entering
-     * a permissive mode (supervised / open) auto-clear the block list
-     * so the user doesn't have to hand-allow each device every morning. */
+    /* emit a control event when the mode transitions */
     if (!st->have_last_mode || mode != st->last_mode) {
         if (st->have_last_mode) {
             metrics_emit_control(st->jl, now, "dhcp-range", NULL,
                                  sch_mode_name(mode), "schedule");
         }
-
-        bool entering_permissive =
-            st->have_last_mode &&
-            (mode == SCH_MODE_SUPERVISED || mode == SCH_MODE_OPEN);
-        if (entering_permissive) {
-            if (st->blocks.n > 0) {
-                for (size_t i = 0; i < st->blocks.n; i++) {
-                    const wg_block_item_t *it = &st->blocks.items[i];
-                    uint32_t ip;
-                    char ipbuf[16] = "";
-                    if (blocks_resolve_ip(&st->leases, it->key, &ip))
-                        ip_format(ip, ipbuf);
-                    metrics_emit_control(st->jl, now, it->key,
-                                         ipbuf[0] ? ipbuf : NULL,
-                                         "allow", "auto-open");
-                }
-                blocks_clear(&st->blocks);
-                blocks_save(&st->blocks);
-            }
-            /* Carrying yesterday's supervised triggers into a new day
-             * would re-block devices the moment supervised mode kicks
-             * in — same morning-fresh-start intent as the blocks.json
-             * sweep above. */
-            supervisor_clear_triggers(st->sup);
-            reconcile_request(st);
-        }
-
         st->last_mode      = mode;
         st->have_last_mode = true;
     }
@@ -369,20 +314,9 @@ static int init_all(wg_state_t *st, const char *conf_override) {
     arp_bind_init(&st->ab, st->cfg.ip_bin, st->cfg.iface, st->cfg.static_cidr);
     arp_bind_apply(&st->ab, &st->leases);
 
-    blocks_init(&st->blocks, st->cfg.blocks_json);
-    blocks_load(&st->blocks);
-
-    st->sched = schedule_new(st->cfg.schedule_json, st->cfg.grants_json);
+    st->sched = schedule_new(st->cfg.schedule_json);
     if (!st->sched) return -1;
     schedule_load(st->sched);
-
-    st->sup = supervisor_new(st->cfg.supervised_json, st->cfg.triggers_json);
-    if (!st->sup) return -1;
-    supervisor_configure(st->sup,
-                         st->cfg.supervised_threshold_min,
-                         st->cfg.supervised_cooldown_min,
-                         st->cfg.supervised_min_bytes_per_min);
-    supervisor_load(st->sup);
 
     strncpy(st->ipt.iptables_bin, st->cfg.iptables_bin,
             sizeof(st->ipt.iptables_bin) - 1);
@@ -391,6 +325,15 @@ static int init_all(wg_state_t *st, const char *conf_override) {
     if (!st->ipset) return -1;
     /* iptables FORWARD reconcile below installs the wgate_allow ACCEPT
      * rules (and the rest of the wgatectl block) — no separate bootstrap. */
+
+    st->filterd = filterd_new(st->cfg.filterd_json, st->cfg.ipset_bin,
+                              st->cfg.supervised_json);
+    if (!st->filterd) return -1;
+    filterd_load(st->filterd);
+
+    st->pins = pins_new(st->cfg.pins_json, st->cfg.ipset_bin);
+    if (!st->pins) return -1;
+    pins_load(st->pins);
 
     st->jl = jsonl_open(st->cfg.jsonl_dir, st->cfg.jsonl_retain_days);
     if (!st->jl) return -1;
@@ -403,19 +346,20 @@ static int init_all(wg_state_t *st, const char *conf_override) {
         .net_addr = st->cfg.net_addr,
         .net_mask = st->cfg.net_mask,
         .ipset    = st->ipset,
-        .metrics  = st->metrics
+        .metrics  = st->metrics,
+        .filterd  = st->filterd,
     };
     st->sniffer = sniffer_open(&scfg);
     if (!st->sniffer) return -1;
 
-    st->app.cfg    = &st->cfg;
-    st->app.leases = &st->leases;
-    st->app.blocks = &st->blocks;
-    st->app.ipt    = &st->ipt;
-    st->app.jl     = st->jl;
-    st->app.sched  = st->sched;
-    st->app.sup    = st->sup;
-    st->app.ab     = &st->ab;
+    st->app.cfg     = &st->cfg;
+    st->app.leases  = &st->leases;
+    st->app.ipt     = &st->ipt;
+    st->app.jl      = st->jl;
+    st->app.sched   = st->sched;
+    st->app.filterd = st->filterd;
+    st->app.pins    = st->pins;
+    st->app.ab      = &st->ab;
     st->app.reconcile_request_cb = reconcile_request_cb;
     st->app.reconcile_cb_arg     = st;
     st->app.dnsmasq_reload_request_cb = dnsmasq_reload_request_cb;
@@ -440,10 +384,10 @@ static int init_all(wg_state_t *st, const char *conf_override) {
     if (ep_add(st->epfd, sniffer_fd(st->sniffer), EPOLLIN, &g_pcap_ref)     < 0) return -1;
     if (ep_add(st->epfd, ipc_fd(st->ipc),         EPOLLIN, &g_ipc_listen_ref) < 0) return -1;
 
-    /* initial reconcile from persisted blocks + current schedule state */
+    /* initial reconcile from current schedule + pin state */
     int64_t init_now = now_wall_s();
     schedule_tick(st->sched, init_now);
-    supervisor_tick(st->sup, &st->leases, init_now);
+    pins_tick(st->pins, init_now);
     st->last_mode      = schedule_effective_mode(st->sched, init_now, NULL);
     st->have_last_mode = true;
     /* Prime the gate so startup applies immediately regardless of prior
@@ -452,9 +396,8 @@ static int init_all(wg_state_t *st, const char *conf_override) {
     st->reconcile_pending = false;
     reconcile_apply_now(st);
 
-    LOG_I("wgatectl: up (iface=%s network=%s blocks=%zu mode=%s)",
-          st->cfg.iface, st->cfg.network_cidr, st->blocks.n,
-          sch_mode_name(st->last_mode));
+    LOG_I("wgatectl: up (iface=%s network=%s mode=%s)",
+          st->cfg.iface, st->cfg.network_cidr, sch_mode_name(st->last_mode));
     return 0;
 }
 
@@ -504,16 +447,17 @@ static void on_signal(wg_state_t *st) {
     struct signalfd_siginfo si;
     while (read(st->sfd, &si, sizeof(si)) == sizeof(si)) {
         if (si.ssi_signo == SIGHUP) {
-            LOG_I("SIGHUP: reloading dnsmasq.conf + schedule + supervised");
+            LOG_I("SIGHUP: reloading dnsmasq.conf + schedule + filterd + pins");
             leases_reload(&st->leases, st->cfg.dnsmasq_conf,
                           st->cfg.dnsmasq_leases, st->cfg.static_cidr);
             snapshot_dnsmasq_mtimes(st);
             arp_bind_apply(&st->ab, &st->leases);
             schedule_load(st->sched);
-            supervisor_load(st->sup);
+            filterd_load(st->filterd);
+            pins_load(st->pins);
             int64_t now = now_wall_s();
             schedule_tick(st->sched, now);
-            supervisor_tick(st->sup, &st->leases, now);
+            pins_tick(st->pins, now);
             reconcile_request(st);
         } else {
             LOG_I("signal %u: shutting down", si.ssi_signo);
@@ -590,12 +534,11 @@ static int loop(wg_state_t *st) {
 
 static void shutdown_all(wg_state_t *st) {
     if (st->metrics && st->jl)
-        metrics_flush(st->metrics, st->jl, &st->leases, &st->blocks,
-                      now_wall_s());
+        metrics_flush(st->metrics, st->jl, &st->leases, now_wall_s());
 
-    blocks_save(&st->blocks);
-    if (st->sched) schedule_save(st->sched);
-    if (st->sup)   supervisor_save(st->sup);
+    if (st->sched)   schedule_save(st->sched);
+    if (st->filterd) filterd_save(st->filterd);
+    if (st->pins)    pins_save(st->pins);
 
     if (st->ipc)     ipc_close(st->ipc);
     if (st->sniffer) sniffer_close(st->sniffer);
@@ -603,13 +546,13 @@ static void shutdown_all(wg_state_t *st) {
     if (st->jl)      jsonl_close(st->jl);
     if (st->ipset)   ipset_mgr_free(st->ipset);
 
-    if (st->sched) schedule_free(st->sched);
-    if (st->sup)   supervisor_free(st->sup);
+    if (st->sched)   schedule_free(st->sched);
+    if (st->filterd) filterd_free(st->filterd);
+    if (st->pins)    pins_free(st->pins);
 
     arp_bind_shutdown(&st->ab);
     arp_bind_free(&st->ab);
 
-    blocks_free(&st->blocks);
     leases_free(&st->leases);
 
     if (st->tfd  >= 0) close(st->tfd);

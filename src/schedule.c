@@ -1,5 +1,4 @@
 #include "schedule.h"
-#include "supervisor.h"
 #include "log.h"
 #include "util.h"
 
@@ -9,11 +8,10 @@
 #include <string.h>
 #include <time.h>
 
-/* Hard caps: prevent API floods from growing these lists without bound
- * (and bloating the persisted JSON). Normal operation keeps these well
- * under the cap; a WARN log fires when we hit the ceiling. */
+/* Hard cap: prevent API floods from growing the override list without
+ * bound (and bloating the persisted JSON). A WARN log fires when we hit
+ * the ceiling. */
 #define OVERRIDES_MAX 256
-#define GRANTS_MAX    512
 
 /* ------------------------------ model ------------------------------ */
 
@@ -31,12 +29,6 @@ typedef struct {
     char       reason[64];
 } sch_override_t;
 
-typedef struct {
-    char    key[64];
-    int64_t until;
-    char    reason[64];
-} sch_grant_t;
-
 struct wg_schedule {
     sch_base_t         base[16];
     size_t             n_base;
@@ -44,40 +36,37 @@ struct wg_schedule {
     sch_override_t    *overrides;
     size_t             n_overrides, cap_overrides;
 
-    sch_grant_t       *grants;
-    size_t             n_grants, cap_grants;
-
     uint64_t           id_counter;
 
     char               schedule_path[256];
-    char               grants_path[256];
 
     bool               dirty_schedule;
-    bool               dirty_grants;
 };
 
 const char *sch_mode_name(sch_mode_t m) {
     switch (m) {
-        case SCH_MODE_CLOSED:     return "closed";
-        case SCH_MODE_SUPERVISED: return "supervised";
-        case SCH_MODE_OPEN:       return "open";
+        case SCH_MODE_CLOSED:   return "closed";
+        case SCH_MODE_FILTERED: return "filtered";
+        case SCH_MODE_OPEN:     return "open";
     }
     return "?";
 }
 
 bool sch_mode_parse(const char *s, sch_mode_t *out) {
     if (!s || !out) return false;
-    if      (!strcmp(s, "closed"))     { *out = SCH_MODE_CLOSED;     return true; }
-    else if (!strcmp(s, "supervised")) { *out = SCH_MODE_SUPERVISED; return true; }
-    else if (!strcmp(s, "open"))       { *out = SCH_MODE_OPEN;       return true; }
+    if      (!strcmp(s, "closed"))   { *out = SCH_MODE_CLOSED;   return true; }
+    else if (!strcmp(s, "filtered")) { *out = SCH_MODE_FILTERED; return true; }
+    else if (!strcmp(s, "open"))     { *out = SCH_MODE_OPEN;     return true; }
     return false;
 }
 
 /* ------------------------------ defaults --------------------------- */
 
 /* Default weekly base (local time):
- *   daily 07:00 → supervised
+ *   daily 07:00 → filtered
  *   daily 18:00 → open
+ *   Sat/Sun         09:00 → open    (weekends jump straight to open at 09:00,
+ *                                    bits 0,6 = 0x41)
  *   Sun/Mon/Wed/Thu 23:00 → closed   (bits 0,1,3,4 = 0x1B)
  *   Tue             23:30 → closed   (bit 2        = 0x04)
  *   Sat/Sun         00:00 → closed   (bits 0,6     = 0x41)
@@ -86,11 +75,12 @@ bool sch_mode_parse(const char *s, sch_mode_t *out) {
  *       instant, so "Sat 00:00" closes Fri night).
  */
 static const sch_base_t kDefaultBase[] = {
-    { 0x7F, 700,  SCH_MODE_SUPERVISED },
-    { 0x7F, 1800, SCH_MODE_OPEN       },
-    { 0x1B, 2300, SCH_MODE_CLOSED     },
-    { 0x04, 2330, SCH_MODE_CLOSED     },
-    { 0x41, 0,    SCH_MODE_CLOSED     },
+    { 0x7F, 700,  SCH_MODE_FILTERED },
+    { 0x41, 900,  SCH_MODE_OPEN     },
+    { 0x7F, 1800, SCH_MODE_OPEN     },
+    { 0x1B, 2300, SCH_MODE_CLOSED   },
+    { 0x04, 2330, SCH_MODE_CLOSED   },
+    { 0x41, 0,    SCH_MODE_CLOSED   },
 };
 
 static void apply_defaults(wg_schedule_t *s) {
@@ -100,14 +90,11 @@ static void apply_defaults(wg_schedule_t *s) {
 
 /* ------------------------------ new/free --------------------------- */
 
-wg_schedule_t *schedule_new(const char *schedule_path, const char *grants_path) {
+wg_schedule_t *schedule_new(const char *schedule_path) {
     wg_schedule_t *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
     if (schedule_path) {
         strncpy(s->schedule_path, schedule_path, sizeof(s->schedule_path) - 1);
-    }
-    if (grants_path) {
-        strncpy(s->grants_path, grants_path, sizeof(s->grants_path) - 1);
     }
     apply_defaults(s);
     return s;
@@ -116,7 +103,6 @@ wg_schedule_t *schedule_new(const char *schedule_path, const char *grants_path) 
 void schedule_free(wg_schedule_t *s) {
     if (!s) return;
     free(s->overrides);
-    free(s->grants);
     free(s);
 }
 
@@ -172,17 +158,6 @@ static void grow_overrides(wg_schedule_t *s) {
     if (!n) return;
     s->overrides = n;
     s->cap_overrides = nc;
-}
-
-static void grow_grants(wg_schedule_t *s) {
-    if (s->n_grants < s->cap_grants) return;
-    if (s->cap_grants >= GRANTS_MAX) return;
-    size_t nc = s->cap_grants ? s->cap_grants * 2 : 8;
-    if (nc > GRANTS_MAX) nc = GRANTS_MAX;
-    sch_grant_t *n = realloc(s->grants, nc * sizeof(*n));
-    if (!n) return;
-    s->grants = n;
-    s->cap_grants = nc;
 }
 
 static int load_schedule_file(wg_schedule_t *s) {
@@ -253,49 +228,12 @@ static int load_schedule_file(wg_schedule_t *s) {
     return 0;
 }
 
-static int load_grants_file(wg_schedule_t *s) {
-    if (!s->grants_path[0]) return 0;
-    size_t n = 0;
-    char *buf = read_small_file(s->grants_path, 64 * 1024, &n);
-    if (!buf) return 0;
-    const char *err = NULL;
-    json_val_t *v = json_parse(buf, n, &err);
-    free(buf);
-    if (!v) {
-        LOG_W("grants: parse %s: %s", s->grants_path, err ? err : "?");
-        return -1;
-    }
-    if (v->type != JV_ARR) { json_val_free(v); return -1; }
-    for (size_t i = 0; i < v->u.arr.n; i++) {
-        const json_val_t *e = &v->u.arr.items[i];
-        if (e->type != JV_OBJ) continue;
-        const char *key = NULL, *reason = NULL;
-        int64_t until = 0;
-        json_get_str(json_obj_get(e, "key"),    &key);
-        json_get_str(json_obj_get(e, "reason"), &reason);
-        json_get_i64(json_obj_get(e, "until"),  &until);
-        if (!key) continue;
-        grow_grants(s);
-        if (s->n_grants >= s->cap_grants) continue;
-        sch_grant_t *g = &s->grants[s->n_grants++];
-        memset(g, 0, sizeof(*g));
-        strncpy(g->key, key, sizeof(g->key) - 1);
-        g->until = until;
-        if (reason) strncpy(g->reason, reason, sizeof(g->reason) - 1);
-    }
-    json_val_free(v);
-    return 0;
-}
-
 int schedule_load(wg_schedule_t *s) {
     if (!s) return -1;
     apply_defaults(s);
     s->n_overrides = 0;
-    s->n_grants    = 0;
     load_schedule_file(s);
-    load_grants_file(s);
     s->dirty_schedule = false;
-    s->dirty_grants   = false;
     return 0;
 }
 
@@ -343,31 +281,9 @@ static int save_schedule_file(wg_schedule_t *s) {
     return rc;
 }
 
-static int save_grants_file(wg_schedule_t *s) {
-    if (!s->grants_path[0]) return 0;
-    json_out_t j;
-    json_out_init(&j);
-    json_arr_begin(&j);
-    for (size_t i = 0; i < s->n_grants; i++) {
-        const sch_grant_t *g = &s->grants[i];
-        json_obj_begin(&j);
-        json_kstr(&j, "key",   g->key);
-        json_ki64(&j, "until", g->until);
-        if (g->reason[0]) json_kstr(&j, "reason", g->reason);
-        json_obj_end(&j);
-    }
-    json_arr_end(&j);
-    int rc = atomic_write(s->grants_path,
-                          j.buf ? j.buf : "[]",
-                          j.buf ? j.len : 2);
-    json_out_free(&j);
-    return rc;
-}
-
 int schedule_save(wg_schedule_t *s) {
     int rc = 0;
     if (s->dirty_schedule) { rc |= save_schedule_file(s); s->dirty_schedule = false; }
-    if (s->dirty_grants)   { rc |= save_grants_file(s);   s->dirty_grants   = false; }
     return rc;
 }
 
@@ -498,19 +414,6 @@ void schedule_tick(wg_schedule_t *s, int64_t now_wall) {
     }
     s->n_overrides = w;
 
-    /* prune expired grants */
-    w = 0;
-    for (size_t r = 0; r < s->n_grants; r++) {
-        const sch_grant_t *g = &s->grants[r];
-        if (g->until <= now_wall) {
-            s->dirty_grants = true;
-            continue;
-        }
-        if (w != r) s->grants[w] = *g;
-        w++;
-    }
-    s->n_grants = w;
-
     schedule_save(s);
 }
 
@@ -563,107 +466,6 @@ int schedule_override_remove(wg_schedule_t *s, const char *id) {
     return 0;
 }
 
-/* ----------------------------- grants ----------------------------- */
-
-static void canonicalise_grant_key(const wg_leases_t *leases, const char *key,
-                                   char *out, size_t cap) {
-    blocks_canonicalise(leases, key, out, cap);
-}
-
-int schedule_grant_add_until(wg_schedule_t *s, const wg_leases_t *leases,
-                             const char *key, int64_t until_wall,
-                             const char *reason) {
-    if (!s || !key) return 0;
-    int64_t now = (int64_t)time(NULL);
-    if (until_wall <= now) return 0;
-    char canon[64];
-    canonicalise_grant_key(leases, key, canon, sizeof(canon));
-
-    /* update in place if an entry for this key already exists */
-    for (size_t i = 0; i < s->n_grants; i++) {
-        if (strcmp(s->grants[i].key, canon) == 0) {
-            s->grants[i].until = until_wall;
-            s->grants[i].reason[0] = 0;
-            if (reason) strncpy(s->grants[i].reason, reason,
-                                sizeof(s->grants[i].reason) - 1);
-            s->dirty_grants = true;
-            schedule_save(s);
-            return 1;
-        }
-    }
-    if (s->n_grants >= GRANTS_MAX) {
-        LOG_W("schedule: grants at cap (%d); refusing add", GRANTS_MAX);
-        return 0;
-    }
-    grow_grants(s);
-    if (s->n_grants >= s->cap_grants) return 0;
-    sch_grant_t *g = &s->grants[s->n_grants++];
-    memset(g, 0, sizeof(*g));
-    size_t kn = strnlen(canon, sizeof(g->key) - 1);
-    memcpy(g->key, canon, kn);
-    g->key[kn] = 0;
-    g->until = until_wall;
-    if (reason) strncpy(g->reason, reason, sizeof(g->reason) - 1);
-    s->dirty_grants = true;
-    schedule_save(s);
-    return 1;
-}
-
-int schedule_grant_add(wg_schedule_t *s, const wg_leases_t *leases,
-                       const char *key, int minutes, const char *reason) {
-    if (minutes <= 0) return 0;
-    int64_t until = (int64_t)time(NULL) + (int64_t)minutes * 60;
-    return schedule_grant_add_until(s, leases, key, until, reason);
-}
-
-int schedule_grant_remove(wg_schedule_t *s, const wg_leases_t *leases,
-                          const char *key) {
-    if (!s || !key) return 0;
-    char canon[64];
-    canonicalise_grant_key(leases, key, canon, sizeof(canon));
-    for (size_t i = 0; i < s->n_grants; i++) {
-        if (strcmp(s->grants[i].key, canon) == 0) {
-            memmove(&s->grants[i], &s->grants[i+1],
-                    (s->n_grants - i - 1) * sizeof(*s->grants));
-            s->n_grants--;
-            s->dirty_grants = true;
-            schedule_save(s);
-            return 1;
-        }
-    }
-    return 0;
-}
-
-size_t schedule_active_grant_ips(const wg_schedule_t *s,
-                                 const wg_leases_t *leases,
-                                 int64_t now_wall,
-                                 uint32_t *out, size_t cap) {
-    if (!s || !out || cap == 0) return 0;
-    size_t n = 0;
-    for (size_t i = 0; i < s->n_grants && n < cap; i++) {
-        if (s->grants[i].until <= now_wall) continue;
-        uint32_t ip;
-        if (!blocks_resolve_ip(leases, s->grants[i].key, &ip)) continue;
-        bool dup = false;
-        for (size_t k = 0; k < n; k++) if (out[k] == ip) { dup = true; break; }
-        if (dup) continue;
-        out[n++] = ip;
-    }
-    return n;
-}
-
-bool schedule_grant_active_ip(const wg_schedule_t *s, const wg_leases_t *leases,
-                              uint32_t ip, int64_t now_wall) {
-    if (!s) return false;
-    for (size_t i = 0; i < s->n_grants; i++) {
-        if (s->grants[i].until <= now_wall) continue;
-        uint32_t kip;
-        if (!blocks_resolve_ip(leases, s->grants[i].key, &kip)) continue;
-        if (kip == ip) return true;
-    }
-    return false;
-}
-
 /* ---------------------------- JSON dump --------------------------- */
 
 void schedule_dump_json(const wg_schedule_t *s, int64_t now_wall,
@@ -707,58 +509,5 @@ void schedule_dump_json(const wg_schedule_t *s, int64_t now_wall,
     }
     json_arr_end(j);
 
-    json_key(j, "grants");
-    json_arr_begin(j);
-    for (size_t i = 0; i < s->n_grants; i++) {
-        const sch_grant_t *g = &s->grants[i];
-        json_obj_begin(j);
-        json_kstr(j, "key",   g->key);
-        json_ki64(j, "until", g->until);
-        if (g->reason[0]) json_kstr(j, "reason", g->reason);
-        json_obj_end(j);
-    }
-    json_arr_end(j);
-
     json_obj_end(j);
-}
-
-/* --------------------- effective block-set ------------------------ */
-
-void schedule_compute_blockset(const wg_schedule_t *s,
-                               const wg_supervisor_t *sup,
-                               const wg_blocks_t *blocks,
-                               const wg_leases_t *leases,
-                               const wg_cfg_t *cfg,
-                               int64_t now_wall,
-                               wg_block_set_t *out) {
-    wg_block_set_init(out);
-    sch_mode_t mode = s ? schedule_effective_mode(s, now_wall, NULL)
-                        : SCH_MODE_OPEN;
-
-    /* Mode-driven per-host DROPs: only supervised contributes (its
-     * triggered-device list). Closed mode does not enumerate the
-     * dhcp-range here — iptables_reconcile applies a single
-     * `-i <lan> -j DROP` rule that covers the whole LAN. */
-    if (mode == SCH_MODE_SUPERVISED && sup && leases) {
-        uint32_t trig[256];
-        size_t n = supervisor_triggered_ips(sup, leases, now_wall, trig,
-                                            sizeof(trig) / sizeof(*trig));
-        for (size_t i = 0; i < n; i++) {
-            uint32_t ip = trig[i];
-            if (s && schedule_grant_active_ip(s, leases, ip, now_wall)) continue;
-            wg_block_set_add(out, ip);
-        }
-    }
-
-    /* Permanent blocks from blocks.json — these always apply. */
-    if (blocks) {
-        for (size_t i = 0; i < blocks->n; i++) {
-            uint32_t ip;
-            if (!blocks_resolve_ip(leases, blocks->items[i].key, &ip)) continue;
-            if (cfg && !ip_in_subnet(ip, cfg->net_addr, cfg->net_mask)) continue;
-            if (s && schedule_grant_active_ip(s, leases, ip, now_wall)) continue;
-            if (wg_block_set_has(out, ip)) continue;
-            wg_block_set_add(out, ip);
-        }
-    }
 }

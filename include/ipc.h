@@ -1,7 +1,6 @@
 #ifndef WGATECTL_IPC_H
 #define WGATECTL_IPC_H
 
-#include "blocks.h"
 #include "config.h"
 #include "iptables.h"
 #include "jsonl.h"
@@ -10,9 +9,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Forward declarations: ipc.h should not pull in schedule/supervisor. */
-typedef struct wg_schedule   wg_schedule_t;
-typedef struct wg_supervisor wg_supervisor_t;
+/* Forward declarations to keep ipc.h header-light. */
+typedef struct wg_schedule wg_schedule_t;
+typedef struct wg_filterd  wg_filterd_t;
+typedef struct wg_pins     wg_pins_t;
 struct wg_arp_bind;
 typedef struct wg_arp_bind wg_arp_bind_t;
 
@@ -20,12 +20,12 @@ typedef struct wg_arp_bind wg_arp_bind_t;
 typedef struct {
     wg_cfg_t        *cfg;
     wg_leases_t     *leases;
-    wg_blocks_t     *blocks;
     wg_iptables_t   *ipt;
     wg_arp_bind_t   *ab;
     jsonl_t         *jl;
     wg_schedule_t   *sched;
-    wg_supervisor_t *sup;
+    wg_filterd_t    *filterd;
+    wg_pins_t       *pins;
 
     /* Called by IPC handlers after mutating state. The callback MUST NOT
      * run iptables synchronously — it is expected to coalesce requests

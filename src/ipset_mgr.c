@@ -53,32 +53,41 @@ static int run_ipset(const char *bin, char *const argv[]) {
     return -1;
 }
 
+/* Create+flush a single hash:ip set with the given timeout. */
+static void ensure_set(const char *bin, const char *name, const char *timeout) {
+    {
+        char *argv[] = {
+            (char*)bin, (char*)"create", (char*)name, (char*)"hash:ip",
+            (char*)"timeout", (char*)timeout, (char*)"-exist", NULL
+        };
+        int rc = run_ipset(bin, argv);
+        if (rc != 0) LOG_W("ipset create %s: rc=%d", name, rc);
+    }
+    {
+        char *argv[] = {
+            (char*)bin, (char*)"flush", (char*)name, NULL
+        };
+        int rc = run_ipset(bin, argv);
+        if (rc != 0) LOG_W("ipset flush %s: rc=%d", name, rc);
+    }
+}
+
 ipset_mgr_t *ipset_mgr_new(const char *ipset_bin) {
     ipset_mgr_t *m = calloc(1, sizeof(*m));
     if (!m) return NULL;
     strncpy(m->ipset_bin, ipset_bin, sizeof(m->ipset_bin) - 1);
 
-    /* ipset create wgate_allow hash:ip timeout 0 -exist */
-    {
-        char *argv[] = {
-            (char*)m->ipset_bin, (char*)"create",
-            (char*)"wgate_allow", (char*)"hash:ip",
-            (char*)"timeout",     (char*)"0",
-            (char*)"-exist",
-            NULL
-        };
-        int rc = run_ipset(m->ipset_bin, argv);
-        if (rc != 0) LOG_W("ipset create wgate_allow: rc=%d", rc);
-    }
-    /* flush existing entries (fresh on every daemon start) */
-    {
-        char *argv[] = {
-            (char*)m->ipset_bin, (char*)"flush", (char*)"wgate_allow", NULL
-        };
-        int rc = run_ipset(m->ipset_bin, argv);
-        if (rc != 0) LOG_W("ipset flush wgate_allow: rc=%d", rc);
-    }
-    LOG_I("ipset: wgate_allow ready");
+    ensure_set(m->ipset_bin, "wgate_allow",      "0");
+    /* wgate_filterd entries age out after 10 min if a domain stops
+     * being resolved — see filterd.c FILTERD_TIMEOUT_S. */
+    ensure_set(m->ipset_bin, "wgate_filterd",    "600");
+    /* pin sets: managed by pins_dump_to_ipsets which flushes+repopulates
+     * each minute, so no kernel-side timeout is needed. */
+    ensure_set(m->ipset_bin, "wgate_pin_open",   "0");
+    ensure_set(m->ipset_bin, "wgate_pin_closed", "0");
+    ensure_set(m->ipset_bin, "wgate_pin_filt",   "0");
+
+    LOG_I("ipset: wgate_allow / wgate_filterd / wgate_pin_{open,closed,filt} ready");
     return m;
 }
 

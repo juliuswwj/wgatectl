@@ -16,28 +16,6 @@
  * rules (DOCKER-*, -i wan *, user's custom rules). */
 #define WG_COMMENT "wgatectl"
 
-/* ---------------------------- block set ----------------------------- */
-
-void wg_block_set_init(wg_block_set_t *b) { memset(b, 0, sizeof(*b)); }
-void wg_block_set_free(wg_block_set_t *b) { free(b->blocked_ips); memset(b, 0, sizeof(*b)); }
-
-void wg_block_set_add(wg_block_set_t *b, uint32_t ip) {
-    for (size_t i = 0; i < b->n; i++) if (b->blocked_ips[i] == ip) return;
-    if (b->n == b->cap) {
-        size_t ncap = b->cap ? b->cap * 2 : 32;
-        uint32_t *ni = realloc(b->blocked_ips, ncap * sizeof(*ni));
-        if (!ni) return;
-        b->blocked_ips = ni;
-        b->cap = ncap;
-    }
-    b->blocked_ips[b->n++] = ip;
-}
-
-bool wg_block_set_has(const wg_block_set_t *b, uint32_t ip) {
-    for (size_t i = 0; i < b->n; i++) if (b->blocked_ips[i] == ip) return true;
-    return false;
-}
-
 /* --------------------------- exec helper ---------------------------- */
 
 static int run_iptables(const char *bin, char *const argv[],
@@ -142,9 +120,11 @@ static int append_tagged(const char *bin, const char *const *extra, size_t nextr
 static bool line_is_ours(const char *line, uint32_t net_addr, uint32_t net_mask) {
     /* tagged rules */
     if (strstr(line, "--comment " WG_COMMENT)) return true;
-    /* legacy wgate_allow */
-    if (strstr(line, "--match-set wgate_allow")) return true;
-    /* legacy `-A FORWARD -s <LAN-IP>[/32] -j DROP` (no comment) */
+    /* legacy wgate_* match-set rules (pre-comment-tag) */
+    if (strstr(line, "--match-set wgate_")) return true;
+    /* legacy `-A FORWARD -s <LAN-IP>[/32] -j DROP` (no comment) — these
+     * came from the now-removed per-host blocks subsystem; clean them up
+     * for one release after upgrade so they don't linger. */
     if (strstr(line, " -j DROP") && strstr(line, " -s ")) {
         const char *s = strstr(line, " -s ");
         if (s) {
@@ -194,13 +174,6 @@ static int build_delete_argv(const char *bin, char *line_copy, argv_t *out) {
 
 /* --------------------------- reconcile ------------------------------ */
 
-static int cmp_u32(const void *a, const void *b) {
-    uint32_t x = *(const uint32_t*)a, y = *(const uint32_t*)b;
-    if (x < y) return -1;
-    if (x > y) return 1;
-    return 0;
-}
-
 /* FNV-1a 64. Used only for the desired-state cache; not security-sensitive. */
 static uint64_t fnv1a64(const void *buf, size_t n, uint64_t hash) {
     const uint8_t *p = buf;
@@ -213,58 +186,22 @@ static uint64_t fnv1a64(const void *buf, size_t n, uint64_t hash) {
 
 /* Hash everything that affects the rules pass 2 emits, so that an
  * identical desired state collapses to a no-op in iptables_reconcile.
- * Per-IP sets are filtered through the same ip_in_subnet test that
- * pass 2 applies, so out-of-subnet entries don't bust the cache. */
+ * Per-host pin/block state is realised in ipsets, not in FORWARD rules,
+ * so the signature only needs to track the iface/cidr/network/mode tuple
+ * — those fully determine the rule list. */
 static uint64_t compute_desired_sig(const char *lan_iface,
                                     const char *static_cidr,
                                     uint32_t net_addr, uint32_t net_mask,
-                                    const wg_block_set_t *desired,
-                                    const wg_block_set_t *grants,
-                                    bool closed_mode) {
+                                    bool closed_mode, bool filtered_mode) {
     uint64_t h = 0xcbf29ce484222325ULL;
-    uint8_t flag = closed_mode ? 1 : 0;
-    h = fnv1a64(&flag, 1, h);
+    uint8_t flags = (uint8_t)((closed_mode ? 1 : 0) | (filtered_mode ? 2 : 0));
+    h = fnv1a64(&flags, 1, h);
     if (lan_iface)   h = fnv1a64(lan_iface,   strlen(lan_iface),   h);
     h = fnv1a64("|", 1, h);
     if (static_cidr) h = fnv1a64(static_cidr, strlen(static_cidr), h);
     h = fnv1a64("|", 1, h);
     h = fnv1a64(&net_addr, sizeof(net_addr), h);
     h = fnv1a64(&net_mask, sizeof(net_mask), h);
-    h = fnv1a64("|", 1, h);
-
-    if (desired && desired->n) {
-        uint32_t *sorted = malloc(desired->n * sizeof(*sorted));
-        if (sorted) {
-            size_t k = 0;
-            for (size_t i = 0; i < desired->n; i++) {
-                uint32_t ip = desired->blocked_ips[i];
-                if (!ip_in_subnet(ip, net_addr, net_mask)) continue;
-                sorted[k++] = ip;
-            }
-            qsort(sorted, k, sizeof(*sorted), cmp_u32);
-            h = fnv1a64(sorted, k * sizeof(*sorted), h);
-            free(sorted);
-        }
-    }
-    h = fnv1a64("|", 1, h);
-
-    /* Grants only emit rules in closed mode (rule 4). In other modes
-     * they have no effect on FORWARD, so leave them out of the
-     * signature to avoid re-applying when only a grant changed. */
-    if (closed_mode && grants && grants->n) {
-        uint32_t *sorted = malloc(grants->n * sizeof(*sorted));
-        if (sorted) {
-            size_t k = 0;
-            for (size_t i = 0; i < grants->n; i++) {
-                uint32_t ip = grants->blocked_ips[i];
-                if (!ip_in_subnet(ip, net_addr, net_mask)) continue;
-                sorted[k++] = ip;
-            }
-            qsort(sorted, k, sizeof(*sorted), cmp_u32);
-            h = fnv1a64(sorted, k * sizeof(*sorted), h);
-            free(sorted);
-        }
-    }
     return h;
 }
 
@@ -272,10 +209,8 @@ int iptables_reconcile(wg_iptables_t *t,
                        const char *lan_iface,
                        const char *static_cidr,
                        uint32_t net_addr, uint32_t net_mask,
-                       const wg_block_set_t *desired,
-                       const wg_block_set_t *grants,
                        bool closed_mode,
-                       int *added, int *removed) {
+                       bool filtered_mode) {
     const char *bin = t->iptables_bin;
 
     /* Skip the entire fork-iptables-S + delete + re-append dance when the
@@ -286,12 +221,8 @@ int iptables_reconcile(wg_iptables_t *t,
      * noise that buries actual state changes. */
     uint64_t sig = compute_desired_sig(lan_iface, static_cidr,
                                        net_addr, net_mask,
-                                       desired, grants, closed_mode);
-    if (t->have_last_sig && sig == t->last_sig) {
-        if (added)   *added   = 0;
-        if (removed) *removed = 0;
-        return 0;
-    }
+                                       closed_mode, filtered_mode);
+    if (t->have_last_sig && sig == t->last_sig) return 0;
 
     /* --- pass 1: list FORWARD and delete every rule that's ours --- */
     static char buf[128 * 1024];
@@ -338,8 +269,12 @@ int iptables_reconcile(wg_iptables_t *t,
 
     /* --- pass 2: append the fresh block in the desired order --- */
 
-    /* rule 1, 2: wgate_allow ACCEPT dst, bound to -i <lan> */
-    if (lan_iface && *lan_iface) {
+    bool have_lan = lan_iface && *lan_iface;
+
+    /* rule 1: captive-check whitelist (per dst). The src direction is
+     * intentionally NOT emitted — return traffic comes back via the WAN
+     * iface and is allowed by FORWARD's default-ACCEPT policy. */
+    if (have_lan) {
         const char *r1[] = {
             "-i", lan_iface,
             "-m", "set", "--match-set", "wgate_allow", "dst",
@@ -348,68 +283,76 @@ int iptables_reconcile(wg_iptables_t *t,
         append_tagged(bin, r1, sizeof(r1)/sizeof(*r1), &na);
     }
 
-    /* rule 3: static-zone exempt */
+    /* rule 2: static-zone exempt */
     if (static_cidr && *static_cidr) {
-        const char *r3[] = { "-s", static_cidr, "-j", "ACCEPT" };
+        const char *r2[] = { "-s", static_cidr, "-j", "ACCEPT" };
+        append_tagged(bin, r2, sizeof(r2)/sizeof(*r2), &na);
+    }
+
+    /* rules 3-6: per-host pin overrides — these short-circuit the
+     * global mode for hosts whose IP appears in a wgate_pin_* set. */
+    if (have_lan) {
+        /* rule 3: pin → open, accept */
+        const char *r3[] = {
+            "-i", lan_iface,
+            "-m", "set", "--match-set", "wgate_pin_open", "src",
+            "-j", "ACCEPT"
+        };
         append_tagged(bin, r3, sizeof(r3)/sizeof(*r3), &na);
-    }
 
-    /* rule 4: per-IP ACCEPTs for active grants, only useful in closed
-     * mode where rule 6 would otherwise drop everything. In non-closed
-     * mode grants are already honored by not being listed in `desired`,
-     * so this rule adds no value there. */
-    if (closed_mode && grants && grants->n && lan_iface && *lan_iface) {
-        uint32_t *sorted = malloc(grants->n * sizeof(*sorted));
-        if (sorted) {
-            memcpy(sorted, grants->blocked_ips, grants->n * sizeof(*sorted));
-            qsort(sorted, grants->n, sizeof(*sorted), cmp_u32);
-            for (size_t i = 0; i < grants->n; i++) {
-                uint32_t ip = sorted[i];
-                if (!ip_in_subnet(ip, net_addr, net_mask)) continue;
-                char ipbuf[20], ip_cidr[24];
-                ip_format(ip, ipbuf);
-                snprintf(ip_cidr, sizeof(ip_cidr), "%s/32", ipbuf);
-                const char *r4g[] = { "-i", lan_iface, "-s", ip_cidr, "-j", "ACCEPT" };
-                append_tagged(bin, r4g, sizeof(r4g)/sizeof(*r4g), &na);
-            }
-            free(sorted);
-        }
-    }
+        /* rule 4: pin → closed, drop */
+        const char *r4[] = {
+            "-i", lan_iface,
+            "-m", "set", "--match-set", "wgate_pin_closed", "src",
+            "-j", "DROP"
+        };
+        append_tagged(bin, r4, sizeof(r4)/sizeof(*r4), &na);
 
-    /* rule 5: per-IP drops, sorted for determinism */
-    if (desired && desired->n) {
-        uint32_t *sorted = malloc(desired->n * sizeof(*sorted));
-        if (sorted) {
-            memcpy(sorted, desired->blocked_ips, desired->n * sizeof(*sorted));
-            qsort(sorted, desired->n, sizeof(*sorted), cmp_u32);
-            for (size_t i = 0; i < desired->n; i++) {
-                uint32_t ip = sorted[i];
-                if (!ip_in_subnet(ip, net_addr, net_mask)) continue;
-                char ipbuf[20];
-                char ip_cidr[24];
-                ip_format(ip, ipbuf);
-                snprintf(ip_cidr, sizeof(ip_cidr), "%s/32", ipbuf);
-                const char *r4[] = { "-s", ip_cidr, "-j", "DROP" };
-                append_tagged(bin, r4, sizeof(r4)/sizeof(*r4), &na);
-            }
-            free(sorted);
-        }
-    }
+        /* rule 5: pin → filtered + filterd dst → drop (filter the
+         * matched domains for pinned-filtered hosts). */
+        const char *r5[] = {
+            "-i", lan_iface,
+            "-m", "set", "--match-set", "wgate_pin_filt", "src",
+            "-m", "set", "--match-set", "wgate_filterd",  "dst",
+            "-j", "DROP"
+        };
+        append_tagged(bin, r5, sizeof(r5)/sizeof(*r5), &na);
 
-    /* rule 6: bulk -i lan DROP, only in closed mode */
-    if (closed_mode && lan_iface && *lan_iface) {
-        const char *r6[] = { "-i", lan_iface, "-j", "DROP" };
+        /* rule 6: pin → filtered, accept the rest (so the global mode
+         * doesn't subsequently drop them in closed/filtered mode). */
+        const char *r6[] = {
+            "-i", lan_iface,
+            "-m", "set", "--match-set", "wgate_pin_filt", "src",
+            "-j", "ACCEPT"
+        };
         append_tagged(bin, r6, sizeof(r6)/sizeof(*r6), &na);
+    }
+
+    /* rule 7: global-mode tail */
+    if (have_lan) {
+        if (closed_mode) {
+            const char *r7[] = { "-i", lan_iface, "-j", "DROP" };
+            append_tagged(bin, r7, sizeof(r7)/sizeof(*r7), &na);
+        } else if (filtered_mode) {
+            const char *r7[] = {
+                "-i", lan_iface,
+                "-m", "set", "--match-set", "wgate_filterd", "dst",
+                "-j", "DROP"
+            };
+            append_tagged(bin, r7, sizeof(r7)/sizeof(*r7), &na);
+        }
+        /* open: no rule 7 */
     }
     /* No trailing catch-all ACCEPT: FORWARD's policy is ACCEPT by
      * default, so anything that falls off the end is already allowed.
      * Appending one would short-circuit admin-added DROP rules placed
      * after ours. */
 
-    if (added)   *added   = na;
-    if (removed) *removed = nr;
+    const char *mode_name = closed_mode   ? "closed"
+                          : filtered_mode ? "filtered"
+                          :                 "open";
     if (na || nr)
-        LOG_I("iptables: +%d -%d (mode=%s)", na, nr, closed_mode ? "closed" : "open/supervised");
+        LOG_I("iptables: +%d -%d (mode=%s)", na, nr, mode_name);
     t->last_sig      = sig;
     t->have_last_sig = true;
     return 0;

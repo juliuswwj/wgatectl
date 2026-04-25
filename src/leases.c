@@ -226,3 +226,34 @@ bool leases_dhcp_range(const wg_leases_t *t, uint32_t *lo, uint32_t *hi) {
     if (hi) *hi = t->dhcp_hi;
     return true;
 }
+
+void leases_canon_key(const wg_leases_t *t, const char *key,
+                      char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = 0;
+    if (!key) return;
+    uint32_t ip;
+    if (ip_parse(key, &ip)) {
+        char ipbuf[16];
+        ip_format(ip, ipbuf);
+        size_t n = strnlen(ipbuf, cap - 1);
+        memcpy(out, ipbuf, n);
+        out[n] = 0;
+        return;
+    }
+    const wg_lease_t *l = t ? leases_by_name(t, key) : NULL;
+    const char *src = (l && l->name[0]) ? l->name : key;
+    size_t n = strnlen(src, cap - 1);
+    memcpy(out, src, n);
+    out[n] = 0;
+}
+
+bool leases_resolve_ip(const wg_leases_t *t, const char *key, uint32_t *out) {
+    if (!key || !out) return false;
+    uint32_t ip;
+    if (ip_parse(key, &ip)) { *out = ip; return true; }
+    const wg_lease_t *l = t ? leases_by_name(t, key) : NULL;
+    if (!l) return false;
+    *out = l->ip;
+    return true;
+}

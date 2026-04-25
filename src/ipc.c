@@ -1,11 +1,12 @@
 #include "ipc.h"
 #include "arp_bind.h"
 #include "dnsmasq_conf.h"
+#include "filterd.h"
 #include "json.h"
 #include "log.h"
 #include "metrics.h"
+#include "pins.h"
 #include "schedule.h"
-#include "supervisor.h"
 #include "util.h"
 
 #include <arpa/inet.h>
@@ -253,11 +254,6 @@ static void do_reconcile(wg_ipc_app_t *app) {
         app->reconcile_request_cb(app->reconcile_cb_arg);
 }
 
-static void reconcile_after_change(wg_ipc_app_t *app) {
-    do_reconcile(app);
-    blocks_save(app->blocks);
-}
-
 /* -------------------- handlers -------------------- */
 
 static void handle_status(wg_ipc_t *ipc, client_t *c) {
@@ -268,12 +264,12 @@ static void handle_status(wg_ipc_t *ipc, client_t *c) {
     /* uptime reflects the host kernel, not the daemon process — the
      * agent cares about box health, not whether wgatectl just
      * restarted for a config reload. */
-    json_ki64(&j, "uptime_s", now_boot_s());
-    json_ki64(&j, "blocked_count", (int)ipc->app->blocks->n);
-    json_ki64(&j, "lease_count",   (int)ipc->app->leases->n);
+    json_ki64(&j, "uptime_s",   now_boot_s());
+    json_ki64(&j, "lease_count", (int)ipc->app->leases->n);
+    int64_t now = now_wall_s();
+    json_ki64(&j, "pins_count",  (int)pins_count(ipc->app->pins, now));
     json_kstr(&j, "iface",   ipc->app->cfg->iface);
     json_kstr(&j, "network", ipc->app->cfg->network_cidr);
-    int64_t now = now_wall_s();
     int64_t next = 0;
     sch_mode_t mode = schedule_effective_mode(ipc->app->sched, now, &next);
     json_kstr(&j, "mode", sch_mode_name(mode));
@@ -285,7 +281,8 @@ static void handle_status(wg_ipc_t *ipc, client_t *c) {
 
 static void handle_hosts(wg_ipc_t *ipc, client_t *c) {
     const wg_leases_t *leases = ipc->app->leases;
-    const wg_blocks_t *blocks = ipc->app->blocks;
+    const wg_pins_t   *pins   = ipc->app->pins;
+    int64_t now = now_wall_s();
 
     json_out_t j;
     json_out_init(&j);
@@ -296,39 +293,16 @@ static void handle_hosts(wg_ipc_t *ipc, client_t *c) {
         char ipbuf[16], macbuf[18];
         ip_format(l->ip, ipbuf);
         mac_format(l->mac, macbuf);
-        const wg_block_item_t *bi = blocks_find_by_ip(blocks, leases, l->ip);
+        bool pinned = false;
+        sch_mode_t pmode = pins_for_ip(pins, leases, l->ip, now, &pinned);
         json_obj_begin(&j);
         if (l->name[0]) json_kstr(&j, "name", l->name);
         else            json_knull(&j, "name");
         json_kstr (&j, "ip",  ipbuf);
         json_kstr (&j, "mac", macbuf);
         json_kbool(&j, "is_static", l->is_static);
-        json_kbool(&j, "blocked", bi != NULL);
-        if (bi) {
-            if (bi->reason && *bi->reason) json_kstr(&j, "block_reason", bi->reason);
-            if (bi->added_at)              json_ki64(&j, "block_added_at", bi->added_at);
-        }
-        json_obj_end(&j);
-    }
-    /* also surface any blocked keys that don't correspond to a lease
-     * (e.g. a raw IP that the agent blocked for a phantom device) */
-    for (size_t i = 0; i < blocks->n; i++) {
-        const wg_block_item_t *bi = &blocks->items[i];
-        const char *bkey = bi->key;
-        uint32_t ip;
-        bool have_ip = blocks_resolve_ip(leases, bkey, &ip);
-        if (have_ip && leases_by_ip(leases, ip)) continue;
-        if (!have_ip && leases_by_name(leases, bkey)) continue;
-        json_obj_begin(&j);
-        json_kstr (&j, "name", bkey);
-        if (have_ip) {
-            char ipbuf[16];
-            ip_format(ip, ipbuf);
-            json_kstr(&j, "ip", ipbuf);
-        }
-        json_kbool(&j, "blocked", true);
-        if (bi->reason && *bi->reason) json_kstr(&j, "block_reason", bi->reason);
-        if (bi->added_at)              json_ki64(&j, "block_added_at", bi->added_at);
+        json_kbool(&j, "pinned", pinned);
+        if (pinned) json_kstr(&j, "pin_mode", sch_mode_name(pmode));
         json_obj_end(&j);
     }
     json_arr_end(&j);
@@ -349,91 +323,6 @@ static const char *path_after_key(const char *path, const char *prefix,
     memcpy(key_out, p, kl);
     key_out[kl] = 0;
     return slash + 1;
-}
-
-/* POST /hosts/<key>/block?reason=
- *   Add <key> to the block list. `reason` lands in blocks.json. The
- *   entry is cleared automatically on the next supervised/open mode
- *   transition; there is no permanent block. */
-static void handle_host_block(wg_ipc_t *ipc, client_t *c, const char *key) {
-    wg_ipc_app_t *app = ipc->app;
-    char *reason = query_get(query_string(c), "reason");
-    int changed = blocks_add(app->blocks, app->leases, key, reason,
-                             now_wall_s());
-    if (changed) {
-        reconcile_after_change(app);
-        char ipbuf[16] = "";
-        uint32_t ip;
-        if (blocks_resolve_ip(app->leases, key, &ip)) ip_format(ip, ipbuf);
-        metrics_emit_control(app->jl, now_wall_s(),
-                             key, ipbuf[0] ? ipbuf : NULL,
-                             "block", "api");
-    }
-    json_out_t j; json_out_init(&j);
-    json_obj_begin(&j);
-    json_kbool(&j, "ok", true);
-    json_kstr (&j, "host", key);
-    json_kbool(&j, "blocked", true);
-    json_kbool(&j, "changed", changed != 0);
-    if (reason && *reason) json_kstr(&j, "reason", reason);
-    json_obj_end(&j);
-    respond_json(c, 200, &j);
-    json_out_free(&j);
-    free(reason);
-}
-
-/* POST /hosts/<key>/allow?minutes=&until=&reason=
- *   Always remove <key> from the block list. If `minutes` or `until`
- *   is given, additionally install a timed grant that punches through
- *   a future closed-mode bulk DROP for the duration. */
-static void handle_host_allow(wg_ipc_t *ipc, client_t *c, const char *key) {
-    wg_ipc_app_t *app = ipc->app;
-    const char *qs = query_string(c);
-    char *mstr  = query_get(qs, "minutes");
-    char *ustr  = query_get(qs, "until");
-    char *reason = query_get(qs, "reason");
-
-    int64_t now = now_wall_s();
-    int64_t until = 0;
-    /* `until` wins over `minutes` when both are given */
-    if (ustr) until = strtoll(ustr, NULL, 10);
-    if (until == 0 && mstr) {
-        int minutes = atoi(mstr);
-        if (minutes > 0) until = now + (int64_t)minutes * 60;
-    }
-
-    int block_removed   = blocks_remove(app->blocks, app->leases, key);
-    int trigger_removed = supervisor_remove_trigger(app->sup, app->leases, key);
-    int grant_added     = 0;
-    if (until > now) {
-        grant_added = schedule_grant_add_until(app->sched, app->leases, key,
-                                               until, reason);
-    }
-
-    if (block_removed || trigger_removed || grant_added) {
-        if (block_removed) blocks_save(app->blocks);
-        do_reconcile(app);
-        char ipbuf[16] = "";
-        uint32_t ip;
-        if (blocks_resolve_ip(app->leases, key, &ip)) ip_format(ip, ipbuf);
-        metrics_emit_control(app->jl, now, key, ipbuf[0] ? ipbuf : NULL,
-                             grant_added ? "grant" : "allow", "api");
-    }
-
-    json_out_t j; json_out_init(&j);
-    json_obj_begin(&j);
-    json_kbool(&j, "ok", true);
-    json_kstr (&j, "host", key);
-    json_kbool(&j, "blocked", false);
-    json_kbool(&j, "changed",
-               (block_removed || trigger_removed || grant_added) != 0);
-    if (until > now) json_ki64(&j, "until", until);
-    if (reason && *reason) json_kstr(&j, "reason", reason);
-    json_obj_end(&j);
-    respond_json(c, 200, &j);
-    json_out_free(&j);
-
-    free(mstr); free(ustr); free(reason);
 }
 
 /* POST /hosts/<key>/name?name=<new>
@@ -529,31 +418,15 @@ static void handle_host_name(wg_ipc_t *ipc, client_t *c, const char *key) {
     free(newname);
 }
 
+/* Forward decl: handle_host_mode_set is defined further down (with the
+ * other pin handlers) but is referenced from the action dispatcher. */
+static void handle_host_mode_set(wg_ipc_t *ipc, client_t *c, const char *key);
+
 static void handle_host_action(wg_ipc_t *ipc, client_t *c,
                                const char *key, const char *action) {
-    if (strcmp(action, "block") == 0) { handle_host_block(ipc, c, key); return; }
-    if (strcmp(action, "allow") == 0) { handle_host_allow(ipc, c, key); return; }
-    if (strcmp(action, "name")  == 0) { handle_host_name (ipc, c, key); return; }
+    if (strcmp(action, "name") == 0) { handle_host_name    (ipc, c, key); return; }
+    if (strcmp(action, "mode") == 0) { handle_host_mode_set(ipc, c, key); return; }
     respond_simple(c, 404, "unknown action");
-}
-
-/* DELETE /hosts/<key>/allow — revoke any active grant for <key>.
- * Does not re-block; if you want a block, POST /block. */
-static void handle_allow_delete(wg_ipc_t *ipc, client_t *c, const char *key) {
-    wg_ipc_app_t *app = ipc->app;
-    int removed = schedule_grant_remove(app->sched, app->leases, key);
-    if (removed) {
-        do_reconcile(app);
-        metrics_emit_control(app->jl, now_wall_s(), key, NULL,
-                             "revoke", "api");
-    }
-    json_out_t j; json_out_init(&j);
-    json_obj_begin(&j);
-    json_kbool(&j, "ok", true);
-    json_kbool(&j, "changed", removed != 0);
-    json_obj_end(&j);
-    respond_json(c, 200, &j);
-    json_out_free(&j);
 }
 
 /* --------------------- schedule handlers ----------------------- */
@@ -605,7 +478,7 @@ static void handle_override_add(wg_ipc_t *ipc, client_t *c) {
     sch_mode_t m;
     if (!sch_mode_parse(mode_str, &m)) {
         json_val_free(v);
-        respond_simple(c, 400, "mode must be closed|supervised|open");
+        respond_simple(c, 400, "mode must be closed|filtered|open");
         return;
     }
     if (at == 0) at = now_wall_s();
@@ -689,19 +562,19 @@ static void handle_mode_force(wg_ipc_t *ipc, client_t *c,
     json_out_free(&j);
 }
 
-/* --------------------- supervised handlers --------------------- */
+/* --------------------- filterd handlers ---------------------- */
 
-static void handle_supervised_list(wg_ipc_t *ipc, client_t *c) {
+static void handle_filtered_list(wg_ipc_t *ipc, client_t *c) {
     json_out_t j;
     json_out_init(&j);
-    supervisor_dump_json(ipc->app->sup, now_wall_s(), &j);
+    filterd_dump_json(ipc->app->filterd, &j);
     respond_json(c, 200, &j);
     json_out_free(&j);
 }
 
-static void handle_supervised_add(wg_ipc_t *ipc, client_t *c,
-                                  const char *domain) {
-    int changed = supervisor_add_target(ipc->app->sup, domain);
+static void handle_filtered_add(wg_ipc_t *ipc, client_t *c,
+                                const char *domain) {
+    int changed = filterd_add_target(ipc->app->filterd, domain);
     json_out_t j; json_out_init(&j);
     json_obj_begin(&j);
     json_kbool(&j, "ok", true);
@@ -712,14 +585,102 @@ static void handle_supervised_add(wg_ipc_t *ipc, client_t *c,
     json_out_free(&j);
 }
 
-static void handle_supervised_remove(wg_ipc_t *ipc, client_t *c,
-                                     const char *domain) {
-    int changed = supervisor_remove_target(ipc->app->sup, domain);
+static void handle_filtered_remove(wg_ipc_t *ipc, client_t *c,
+                                   const char *domain) {
+    int changed = filterd_remove_target(ipc->app->filterd, domain);
     json_out_t j; json_out_init(&j);
     json_obj_begin(&j);
     json_kbool(&j, "ok", true);
     json_kstr (&j, "target", domain);
     json_kbool(&j, "changed", changed != 0);
+    json_obj_end(&j);
+    respond_json(c, 200, &j);
+    json_out_free(&j);
+}
+
+/* ---------------------- pin handlers ------------------------ */
+
+/* POST /hosts/<key>/mode  body: {"mode":"closed|filtered|open",
+ *                                "minutes":N | "until":<epoch>,
+ *                                "reason":"..."}
+ *
+ *   `until` wins over `minutes` when both are present. The resolved
+ *   expiry MUST be > now — pins always have a strict expiry, by
+ *   design. Operators wanting permanent allow should add the host to
+ *   WG_STATIC_CIDR. */
+static void handle_host_mode_set(wg_ipc_t *ipc, client_t *c, const char *key) {
+    wg_ipc_app_t *app = ipc->app;
+    if (!c->body || c->body_len == 0) {
+        respond_simple(c, 400, "body required");
+        return;
+    }
+    const char *err = NULL;
+    json_val_t *v = json_parse(c->body, c->body_len, &err);
+    if (!v || v->type != JV_OBJ) {
+        if (v) json_val_free(v);
+        respond_simple(c, 400, err ? err : "bad json");
+        return;
+    }
+    const char *mode_str = NULL, *reason = NULL;
+    int64_t until = 0, minutes_i = 0;
+    json_get_str(json_obj_get(v, "mode"),    &mode_str);
+    json_get_str(json_obj_get(v, "reason"),  &reason);
+    json_get_i64(json_obj_get(v, "until"),   &until);
+    json_get_i64(json_obj_get(v, "minutes"), &minutes_i);
+
+    sch_mode_t m;
+    if (!sch_mode_parse(mode_str, &m)) {
+        json_val_free(v);
+        respond_simple(c, 400, "mode must be closed|filtered|open");
+        return;
+    }
+    int64_t now = now_wall_s();
+    if (until == 0 && minutes_i > 0) until = now + minutes_i * 60;
+    if (until <= now) {
+        json_val_free(v);
+        respond_simple(c, 400, "minutes or until required (must be > now)");
+        return;
+    }
+
+    int rc = pins_set(app->pins, app->leases, key, m, until, reason);
+    if (rc) {
+        do_reconcile(app);
+        char ipbuf[16] = "";
+        uint32_t ip;
+        if (leases_resolve_ip(app->leases, key, &ip)) ip_format(ip, ipbuf);
+        metrics_emit_control(app->jl, now, key, ipbuf[0] ? ipbuf : NULL,
+                             "pin", sch_mode_name(m));
+    }
+
+    json_out_t j; json_out_init(&j);
+    json_obj_begin(&j);
+    json_kbool(&j, "ok", true);
+    json_kstr (&j, "host",  key);
+    json_kstr (&j, "mode",  sch_mode_name(m));
+    json_ki64 (&j, "until", until);
+    if (reason && *reason) json_kstr(&j, "reason", reason);
+    json_kbool(&j, "changed", rc != 0);
+    json_obj_end(&j);
+    respond_json(c, 200, &j);
+    json_out_free(&j);
+
+    json_val_free(v);
+}
+
+/* DELETE /hosts/<key>/mode — remove the active pin (if any). */
+static void handle_host_mode_delete(wg_ipc_t *ipc, client_t *c,
+                                    const char *key) {
+    wg_ipc_app_t *app = ipc->app;
+    int removed = pins_remove(app->pins, app->leases, key);
+    if (removed) {
+        do_reconcile(app);
+        metrics_emit_control(app->jl, now_wall_s(), key, NULL,
+                             "unpin", "api");
+    }
+    json_out_t j; json_out_init(&j);
+    json_obj_begin(&j);
+    json_kbool(&j, "ok", true);
+    json_kbool(&j, "changed", removed != 0);
     json_obj_end(&j);
     respond_json(c, 200, &j);
     json_out_free(&j);
@@ -760,7 +721,8 @@ static void handle_reload(wg_ipc_t *ipc, client_t *c) {
                   app->cfg->static_cidr);
     if (app->ab) arp_bind_apply(app->ab, app->leases);
     schedule_load(app->sched);
-    supervisor_load(app->sup);
+    filterd_load(app->filterd);
+    pins_load(app->pins);
     do_reconcile(app);
     respond_simple(c, 200, NULL);
 }
@@ -923,7 +885,7 @@ static void dispatch(wg_ipc_t *ipc, client_t *c) {
         if (strcmp(p, "/pve")          == 0) { handle_pve_status(ipc, c);   return; }
         if (strcmp(p, "/hosts")        == 0) { handle_hosts(ipc, c);        return; }
         if (strcmp(p, "/schedule")     == 0) { handle_schedule_get(ipc, c); return; }
-        if (strcmp(p, "/supervised")   == 0) { handle_supervised_list(ipc, c); return; }
+        if (strcmp(p, "/filtered")     == 0) { handle_filtered_list(ipc, c); return; }
         if (strcmp(p, "/metrics/tail") == 0) { handle_metrics_tail(ipc, c); return; }
         respond_simple(c, 404, "no such route");
         return;
@@ -939,8 +901,8 @@ static void dispatch(wg_ipc_t *ipc, client_t *c) {
         if (path_suffix(p, "/mode/", suffix, sizeof(suffix))) {
             handle_mode_force(ipc, c, suffix); return;
         }
-        if (path_suffix(p, "/supervised/", suffix, sizeof(suffix))) {
-            handle_supervised_add(ipc, c, suffix); return;
+        if (path_suffix(p, "/filtered/", suffix, sizeof(suffix))) {
+            handle_filtered_add(ipc, c, suffix); return;
         }
         if (strcmp(p, "/reload")   == 0) { handle_reload(ipc, c);   return; }
         if (strcmp(p, "/pve/wake") == 0) { handle_pve_wake(ipc, c); return; }
@@ -952,12 +914,13 @@ static void dispatch(wg_ipc_t *ipc, client_t *c) {
         if (path_suffix(p, "/schedule/override/", suffix, sizeof(suffix))) {
             handle_override_remove(ipc, c, suffix); return;
         }
-        if ((action = path_after_key(p, "/hosts/", keybuf, sizeof(keybuf))) != NULL
-            && strcmp(action, "allow") == 0) {
-            handle_allow_delete(ipc, c, keybuf); return;
+        if ((action = path_after_key(p, "/hosts/", keybuf, sizeof(keybuf))) != NULL) {
+            if (strcmp(action, "mode") == 0) {
+                handle_host_mode_delete(ipc, c, keybuf); return;
+            }
         }
-        if (path_suffix(p, "/supervised/", suffix, sizeof(suffix))) {
-            handle_supervised_remove(ipc, c, suffix); return;
+        if (path_suffix(p, "/filtered/", suffix, sizeof(suffix))) {
+            handle_filtered_remove(ipc, c, suffix); return;
         }
         respond_simple(c, 404, "no such route");
         return;

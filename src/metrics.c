@@ -111,7 +111,6 @@ static int cmp_bucket_by_bytes_desc(const void *a, const void *b) {
 
 static void emit_traffic_event(jsonl_t *jl, int64_t ts, uint32_t client_ip,
                                const wg_leases_t *leases,
-                               const wg_blocks_t *blocks,
                                bucket_t *buckets_of_client, size_t nb) {
     char iso[48];
     ts_iso8601(ts, iso, sizeof(iso));
@@ -132,7 +131,6 @@ static void emit_traffic_event(jsonl_t *jl, int64_t ts, uint32_t client_ip,
         mac_format(l->mac, macbuf);
         json_kstr(&j, "mac", macbuf);
     }
-    json_kbool(&j, "blocked", blocks_contains_ip(blocks, leases, client_ip));
 
     qsort(buckets_of_client, nb, sizeof(*buckets_of_client),
           cmp_bucket_by_bytes_desc);
@@ -383,24 +381,11 @@ void metrics_emit_control(jsonl_t *jl, int64_t ts_secs,
     json_out_free(&j);
 }
 
-/* --------------------------- iterator ------------------------------- */
-
-void metrics_foreach_bucket(const wg_metrics_t *m,
-                            metrics_bucket_cb_t cb, void *arg) {
-    if (!m || !cb) return;
-    for (size_t i = 0; i < BUCKET_CAP; i++) {
-        const bucket_t *b = &m->buckets[i];
-        if (b->client_ip == 0) continue;
-        cb(b->client_ip, b->domain, b->bytes, b->pkts, arg);
-    }
-}
-
 /* ---------------------------- flush --------------------------------- */
 
 void metrics_flush(wg_metrics_t *m,
                    jsonl_t *jl,
                    const wg_leases_t *leases,
-                   const wg_blocks_t *blocks,
                    int64_t ts_secs) {
     if (!m) return;
 
@@ -431,7 +416,7 @@ void metrics_flush(wg_metrics_t *m,
         for (size_t k = 0; k < BUCKET_CAP; k++) {
             if (m->buckets[k].client_ip == c) pack[nb++] = m->buckets[k];
         }
-        emit_traffic_event(jl, ts_secs, c, leases, blocks, pack, nb);
+        emit_traffic_event(jl, ts_secs, c, leases, pack, nb);
         free(pack);
     }
 

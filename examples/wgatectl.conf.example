@@ -15,38 +15,26 @@ WG_NETWORK=10.6.6.0/24
 WG_DNSMASQ_CONF=/etc/dnsmasq.conf
 WG_DNSMASQ_LEASES=/var/lib/misc/dnsmasq.leases
 
-# Block-list persistence (a JSON array of IP or name strings).
-WG_BLOCKS_JSON=/opt/wgatectl/blocks.json
-
 # Schedule state (weekly base + pending one-shot overrides).  If missing,
-# the hard-coded defaults apply (daily 07:00 supervised, 18:00 open;
+# the hard-coded defaults apply (daily 07:00 filtered, 18:00 open;
 # Sun/Mon/Wed/Thu 23:00 closed, Tue 23:30 closed, Sat/Sun 00:00 closed).
 WG_SCHEDULE_JSON=/opt/wgatectl/schedule.json
 
-# Supervised-mode targets: JSON array of domain suffixes (case-insensitive,
-# label-boundary match).  The supervisor fully blocks any device whose
-# traffic hits any of these for N consecutive minutes, for M minutes.
+# Filter-mode targets: JSON array of domain suffixes (case-insensitive,
+# label-boundary match).  Passive DNS sniffing populates the kernel
+# `wgate_filterd` ipset; in `filtered` mode (or for hosts pinned to
+# filtered) iptables drops traffic whose destination IP is in that set.
+WG_FILTERD_JSON=/opt/wgatectl/filterd.json
+
+# Per-host fixed-mode pins (JSON array of {key, mode, until, reason}).
+# Populated and persisted by POST /hosts/{key}/mode. Pins always have
+# an expiry — there is no permanent pin.
+WG_PINS_JSON=/opt/wgatectl/pins.json
+
+# Legacy pre-1.0 path. If filterd.json does not yet exist but this file
+# does, it is imported once and a single INFO log is emitted; rename it
+# to filterd.json to silence the message.
 WG_SUPERVISED_JSON=/opt/wgatectl/supervised.json
-
-# Supervisor trigger threshold and cool-down, in minutes.  Defaults:
-# 5 minutes of consecutive matching traffic triggers a 60-minute block.
-# Clamped to [1, 120] and [1, 1440] respectively.
-WG_SUPERVISED_THRESHOLD_MIN=5
-WG_SUPERVISED_COOLDOWN_MIN=60
-
-# Minimum matched-domain traffic per minute (bytes) for the minute to
-# count toward the consecutive-trigger counter.  Keepalives / idle
-# heartbeats of a backgrounded app stay under this and don't accrue.
-# Set to 0 to make any matching packet count.
-WG_SUPERVISED_MIN_BYTES_PER_MIN=32768
-
-# Per-device timed grants (JSON array of {key, until, reason}).  Populated
-# and persisted by the /hosts/{key}/grant endpoint.
-WG_GRANTS_JSON=/opt/wgatectl/grants.json
-
-# Supervisor trigger list (JSON array of {key, until}).  Managed
-# automatically; lives here so a restart doesn't release triggers early.
-WG_TRIGGERS_JSON=/opt/wgatectl/triggers.json
 
 # Where the per-minute JSONL events go.  Files are named events-YYYYMMDD.jsonl.
 # The daemon creates this directory if it doesn't exist.

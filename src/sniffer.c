@@ -34,6 +34,7 @@ struct wg_sniffer {
 
     ipset_mgr_t      *ipset;
     wg_metrics_t     *metrics;
+    wg_filterd_t     *filterd;
 
     rev_entry_t       rev[REV_CAP];
 };
@@ -199,6 +200,7 @@ typedef struct {
     const char        *qname;
     uint32_t           now_s;
     bool               is_whitelist;
+    bool               is_filterd;
 } ans_ctx_t;
 
 static void answer_visit(void *vctx, uint32_t ip, uint32_t ttl) {
@@ -206,6 +208,7 @@ static void answer_visit(void *vctx, uint32_t ip, uint32_t ttl) {
     ans_ctx_t *c = vctx;
     rev_insert(c->s, c->client_ip, ip, c->qname, c->now_s);
     if (c->is_whitelist) ipset_mgr_add(c->s->ipset, ip);
+    if (c->is_filterd)   filterd_observe_ip(c->s->filterd, ip);
 }
 
 static bool in_lan(struct wg_sniffer *s, uint32_t ip) {
@@ -236,7 +239,8 @@ static void handle_dns(struct wg_sniffer *s, uint32_t src_ip, uint32_t dst_ip,
     if (!in_lan(s, dst_ip)) return;
     ans_ctx_t ac = {
         .s = s, .client_ip = dst_ip, .qname = qname, .now_s = now_s,
-        .is_whitelist = ipset_mgr_is_whitelist_fqdn(qname)
+        .is_whitelist = ipset_mgr_is_whitelist_fqdn(qname),
+        .is_filterd   = filterd_domain_matches(s->filterd, qname),
     };
     dns_walk_answers(payload, plen, off, h.an, answer_visit, &ac);
 }
@@ -315,6 +319,7 @@ wg_sniffer_t *sniffer_open(const wg_sniffer_cfg_t *cfg) {
     s->net_mask = cfg->net_mask;
     s->ipset    = cfg->ipset;
     s->metrics  = cfg->metrics;
+    s->filterd  = cfg->filterd;
 
     s->pcap = pcap_create(cfg->iface, s->errbuf);
     if (!s->pcap) {

@@ -46,63 +46,52 @@ State lives under `/opt/wgatectl/`:
 
 | File              | Contents                                          |
 |-------------------|---------------------------------------------------|
-| `blocks.json`     | per-device blocks (cleared on next supervised/open entry) |
 | `schedule.json`   | weekly base transitions + pending one-shot overrides |
-| `supervised.json` | domain suffixes that count as supervised targets  |
-| `grants.json`     | per-device timed opens set via `POST /hosts/.../allow?minutes=` |
-| `triggers.json`   | auto-issued 1-hour blocks from the supervisor     |
+| `filterd.json`    | domain suffixes whose A-record IPs are dropped in `filtered` mode |
+| `pins.json`       | per-host fixed-mode pins (mode + expiry)          |
 
-Alongside the JSONL event files and the Unix socket.  All five JSON files
-are optional at startup — missing files are treated as empty (or, for
-`schedule.json`, the hard-coded defaults).
+Alongside the JSONL event files and the Unix socket.  All three JSON
+files are optional at startup — missing files are treated as empty (or,
+for `schedule.json`, the hard-coded defaults).
+
+A legacy `supervised.json` from the previous design is silently imported
+as `filterd.json` on first start and a one-shot `INFO` log is emitted;
+rename it to `filterd.json` to silence the message.
 
 ## Modes and schedule
 
 Three dhcp-range modes:
 
 - **closed** (全禁, sleep) — every non-static IP in the dhcp-range is blocked.
-- **supervised** (监管, no games) — passive: everyone is allowed *by default*,
-  but the traffic aggregator watches per-device per-minute traffic.  A device
-  whose traffic includes any domain listed in `supervised.json` for **5
-  consecutive minutes** gets fully blocked for **1 hour**; after the hour is
-  up, the counter resets (another 5 straight minutes are required to re-fire).
-  Triggers also clear on the next mode transition into supervised/open
-  (same morning-fresh-start sweep that empties `blocks.json`), and on any
-  `POST /hosts/{key}/allow` for the affected device.
-- **open** (全开) — mode contributes no blocks; only `blocks.json` applies.
+- **filtered** (过滤, no games) — only traffic to IPs that resolved from
+  domains listed in `filterd.json` is dropped; everything else passes.
+  Passive DNS sniffing populates the `wgate_filterd` ipset; entries age
+  out after 10 minutes if a domain stops being resolved.
+- **open** (全开) — no global filter; only per-host pins apply.
 
 Default weekly base (local time):
 
-| Time   | Days              | Mode        |
-|--------|-------------------|-------------|
-| 07:00  | daily             | supervised  |
-| 18:00  | daily             | open        |
-| 23:00  | Sun/Mon/Wed/Thu   | closed      |
-| 23:30  | Tue               | closed      |
-| 00:00  | Sat/Sun           | closed      |
+| Time   | Days              | Mode      |
+|--------|-------------------|-----------|
+| 07:00  | daily             | filtered  |
+| 09:00  | Sat/Sun           | open      |
+| 18:00  | daily             | open      |
+| 23:00  | Sun/Mon/Wed/Thu   | closed    |
+| 23:30  | Tue               | closed    |
+| 00:00  | Sat/Sun           | closed    |
 
 One-shot overrides (`{at, mode, expires_at, reason}`) stack on top of the
 base and are walked as a single sorted timeline — the latest entry with
 `at <= now` and `(expires_at == 0 || expires_at > now)` wins.
 
-Per-device **block / allow** semantics:
-
-- `POST /hosts/{key}/block?reason=...` — disable the device. The entry
-  lives in `blocks.json` and is **cleared automatically** the next time
-  the mode transitions into supervised or open (i.e., at the morning
-  wake, or whenever an override/manual mode change lifts closed).
-  There is no permanent block; use a block to mean "pause until
-  naturally reopened".
-- `POST /hosts/{key}/allow?reason=...` — immediately undo the block.
-  No time parameter, pure unblock.  Also drops any active supervisor
-  trigger for the same device, so the per-host DROP doesn't reappear
-  on the next reconcile.
-- `POST /hosts/{key}/allow?minutes=N[&reason=...]` or `?until=<epoch>` —
-  unblock **and** install a timed grant that punches through closed-mode
-  too, i.e., the device stays online for N minutes even if the schedule
-  is in closed. Grants persist in `grants.json`.
-- `DELETE /hosts/{key}/allow` — revoke any active grant for this key
-  (does not re-block; call `/block` if that's what you want).
+Per-host **fixed-mode pin**: `POST /hosts/{key}/mode` body
+`{"mode":"closed|filtered|open","minutes":N|"until":<epoch>,"reason":"..."}`.
+A pin overrides the global mode for that host until expiry. There is
+**no permanent pin** — `until` (or `minutes`) MUST resolve to a future
+timestamp; if you need a permanent allow for a host put it in
+`WG_STATIC_CIDR`. `until` wins over `minutes` when both are given.
+`DELETE /hosts/{key}/mode` removes the pin. Pins are realised via the
+`wgate_pin_open` / `wgate_pin_closed` / `wgate_pin_filt` ipsets.
 
 ## Socket API
 
@@ -114,10 +103,13 @@ Ad-hoc shell:
 ```sh
 curl --unix-socket /opt/wgatectl/wgatectl.sock http://x/status
 curl --unix-socket /opt/wgatectl/wgatectl.sock http://x/hosts | jq .
-curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST 'http://x/hosts/KP115/block?reason=noisy'
-curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST 'http://x/hosts/KP115/allow?reason=unblocked-by-mom'
-curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST 'http://x/hosts/alice/allow?minutes=30&reason=homework'
-curl --unix-socket /opt/wgatectl/wgatectl.sock -XDELETE http://x/hosts/alice/allow
+curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST -H 'content-type: application/json' \
+  http://x/hosts/alice/mode \
+  -d '{"mode":"open","minutes":30,"reason":"homework"}'
+curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST -H 'content-type: application/json' \
+  http://x/hosts/KP115/mode \
+  -d '{"mode":"closed","minutes":120,"reason":"noisy"}'
+curl --unix-socket /opt/wgatectl/wgatectl.sock -XDELETE http://x/hosts/alice/mode
 curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST 'http://x/hosts/10.6.6.42/name?name=alice-phone'
 
 curl --unix-socket /opt/wgatectl/wgatectl.sock http://x/schedule | jq .
@@ -128,9 +120,9 @@ curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST -H 'content-type: applicat
   -d '{"at":1745625600,"expires_at":1745629200,"mode":"closed","reason":"exam"}'
 curl --unix-socket /opt/wgatectl/wgatectl.sock -XDELETE http://x/schedule/override/ov_abc
 
-curl --unix-socket /opt/wgatectl/wgatectl.sock http://x/supervised | jq .
-curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST http://x/supervised/epicgames.com
-curl --unix-socket /opt/wgatectl/wgatectl.sock -XDELETE http://x/supervised/epicgames.com
+curl --unix-socket /opt/wgatectl/wgatectl.sock http://x/filtered | jq .
+curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST http://x/filtered/epicgames.com
+curl --unix-socket /opt/wgatectl/wgatectl.sock -XDELETE http://x/filtered/epicgames.com
 
 curl --unix-socket /opt/wgatectl/wgatectl.sock 'http://x/metrics/tail?since=0'
 curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST http://x/reload
@@ -144,28 +136,25 @@ Routes:
 | Method | Path                              | Purpose                                                 |
 |--------|-----------------------------------|---------------------------------------------------------|
 | GET    | `/status`                         | liveness, counters, current mode, next transition       |
-| GET    | `/hosts`                          | every lease + any extra blocked keys; blocked entries carry `block_reason` / `block_added_at` |
-| POST   | `/hosts/{ip\|name}/block`          | block this device (optional `?reason=`); cleared on next supervised/open entry |
-| POST   | `/hosts/{ip\|name}/allow`          | unblock; with `?minutes=N` or `?until=<epoch>` also install a grant that survives closed mode (optional `?reason=`) |
-| DELETE | `/hosts/{ip\|name}/allow`          | revoke an active grant (does not re-block)              |
+| GET    | `/hosts`                          | every lease; pinned entries carry `pinned: true` and `pin_mode` |
+| POST   | `/hosts/{ip\|name}/mode`           | pin this host to a fixed mode for a time window — JSON body `{mode, minutes\|until, reason}` |
+| DELETE | `/hosts/{ip\|name}/mode`           | remove the active pin                                   |
 | POST   | `/hosts/{ip\|name\|mac}/name?name=<new>` | set the DHCP-reservation name for this device — rewrites `dnsmasq.conf` + debounced reload |
-| GET    | `/schedule`                       | current mode + base + pending overrides + active grants |
+| GET    | `/schedule`                       | current mode + base + pending overrides                 |
 | POST   | `/schedule/override`              | add one-shot override (JSON body `{at,mode,expires_at,reason}`) |
 | DELETE | `/schedule/override/{id}`         | remove a pending override                               |
-| POST   | `/mode/{closed\|supervised\|open}` | force mode now; optional `?until=<epoch>`                |
-| GET    | `/supervised`                     | list supervised domain targets + active triggers        |
-| POST   | `/supervised/{domain}`            | add target                                              |
-| DELETE | `/supervised/{domain}`            | remove target                                           |
+| POST   | `/mode/{closed\|filtered\|open}`   | force mode now; optional `?until=<epoch>`                |
+| GET    | `/filtered`                       | list filterd domain targets                             |
+| POST   | `/filtered/{domain}`              | add target                                              |
+| DELETE | `/filtered/{domain}`              | remove target                                           |
 | GET    | `/metrics/tail?since=<ts>`        | NDJSON tail of today's event file                       |
-| POST   | `/reload`                         | re-read dnsmasq.conf, `schedule.json`, `supervised.json` (also runs automatically when `dnsmasq.conf` / `dnsmasq.leases` mtime changes) |
+| POST   | `/reload`                         | re-read dnsmasq.conf, `schedule.json`, `filterd.json`, `pins.json` (also runs automatically when `dnsmasq.conf` / `dnsmasq.leases` mtime changes) |
 | GET    | `/pve`                            | parallel `ping` of `pve` / `mint` / `twin` (looked up in leases) — each entry is `up`, `down`, or `unknown` |
 | POST   | `/pve/wake`                       | send a WoL magic packet to `WG_PVE_MAC` on the LAN broadcast (UDP/9) |
 
-Endpoints that don't need a body accept bodyless requests (as before).
-`POST /schedule/override` is the only endpoint that *requires* a JSON
-body (`content-type: application/json`).  The previous `POST /dhcp-range/block`
-and `POST /dhcp-range/allow` routes are **removed** — use
-`/mode/closed` and `/mode/open` instead.
+Endpoints that don't need a body accept bodyless requests.
+`POST /schedule/override` and `POST /hosts/{key}/mode` *require* a JSON
+body (`content-type: application/json`).
 
 ## JSONL events
 
@@ -174,7 +163,7 @@ line.  `kind` is `traffic`, `system`, or `control`.
 
 ```json
 {"ts":"2026-04-20T15:43:00-07:00","kind":"traffic","ip":"10.6.6.161",
- "name":"oneplus11","mac":"aa:bb:cc:dd:ee:ff","blocked":false,
+ "name":"oneplus11","mac":"aa:bb:cc:dd:ee:ff",
  "domains":[{"name":"tiktok.com","bytes":3083371,"pkts":2417},
             {"name":"gstatic.com","bytes":12000,"pkts":30},
             {"name":"8.8.8.8","bytes":500,"pkts":5}]}
@@ -183,18 +172,17 @@ line.  `kind` is `traffic`, `system`, or `control`.
  "mem":{"used":..., "total":...},"disk":[...],"temp_c":[...],
  "uptime_s":184322,"iface":[...]}
 
-{"ts":"...","kind":"control","action":"block","name":"KP115",
- "ip":"10.6.6.97","reason":"api"}
+{"ts":"...","kind":"control","action":"pin","name":"alice",
+ "ip":"10.6.6.12","reason":"open"}
 
 {"ts":"...","kind":"control","action":"closed",
  "name":"dhcp-range","reason":"schedule"}
-
-{"ts":"...","kind":"control","action":"block","name":"alice",
- "ip":"10.6.6.12","reason":"supervised"}
 ```
 
-`reason` is `api` for direct socket calls, `schedule` for mode-transition
-edges, and `supervised` for trigger-fires from the supervisor.
+For `control` events `action` is `pin` / `unpin` for per-host mode pins,
+or one of `closed` / `filtered` / `open` for global mode transitions
+(then `name="dhcp-range"`). `reason` is `api` for socket calls,
+`schedule` for mode-transition edges, or the chosen mode name for pins.
 
 Domain labelling comes solely from sniffed DNS responses; unresolved
 server IPs appear as their dotted-quad string.  The top 64 domains per
@@ -220,14 +208,22 @@ flushing FORWARD — is not auto-healed until the next real change or a
 The tail of FORWARD (after external rules) looks like:
 
 ```
--A FORWARD -i <lan> -m set --match-set wgate_allow dst -j ACCEPT
--A FORWARD -i <lan> -m set --match-set wgate_allow src -j ACCEPT
--A FORWARD -s <WG_STATIC_CIDR> -j ACCEPT                 # (if set)
--A FORWARD -i <lan> -s 10.6.6.99/32 -j ACCEPT            # active grant, only when mode=closed
--A FORWARD -s 10.6.6.159/32 -j DROP                      # per-device block
- …
--A FORWARD -i <lan> -j DROP                              # only when mode=closed
+-A FORWARD -i <lan> -m set --match-set wgate_allow      dst -j ACCEPT
+-A FORWARD -s <WG_STATIC_CIDR> -j ACCEPT                                # (if set)
+-A FORWARD -i <lan> -m set --match-set wgate_pin_open   src -j ACCEPT
+-A FORWARD -i <lan> -m set --match-set wgate_pin_closed src -j DROP
+-A FORWARD -i <lan> -m set --match-set wgate_pin_filt   src \
+                    -m set --match-set wgate_filterd    dst -j DROP
+-A FORWARD -i <lan> -m set --match-set wgate_pin_filt   src -j ACCEPT
+# global mode tail:
+-A FORWARD -i <lan> -j DROP                                             # closed
+# or:
+-A FORWARD -i <lan> -m set --match-set wgate_filterd dst -j DROP        # filtered
+# or nothing (open).
 ```
+
+The chain is stateless (no `-m state`). When a pin or global mode flips,
+in-flight TCP fails through retransmission/RST — same behaviour as before.
 
 FORWARD's default policy is ACCEPT, so traffic that falls off the end
 of our block is already allowed; we deliberately do not append a
@@ -269,5 +265,5 @@ removed.
 ## Tests
 
 ```sh
-make test          # builds + runs tests/test_schedule and tests/test_supervisor
+make test          # builds + runs tests/test_schedule, test_pins, test_filterd, test_dnsmasq_conf
 ```

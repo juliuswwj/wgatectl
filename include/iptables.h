@@ -16,21 +16,6 @@ typedef struct {
     bool     have_last_sig;
 } wg_iptables_t;
 
-/* The set of LAN IPs that should be per-host DROPped (permanent blocks
- * from blocks.json plus any supervisor-triggered device minus any active
- * grants). Closed-mode dhcp-range blocking is NOT enumerated here — a
- * single `-i <lan> -j DROP` rule covers that. */
-typedef struct {
-    uint32_t *blocked_ips;   /* host-order */
-    size_t    n;
-    size_t    cap;
-} wg_block_set_t;
-
-void wg_block_set_init(wg_block_set_t *b);
-void wg_block_set_free(wg_block_set_t *b);
-void wg_block_set_add (wg_block_set_t *b, uint32_t ip);
-bool wg_block_set_has (const wg_block_set_t *b, uint32_t ip);
-
 /* Reconcile the tail of the FORWARD chain so it matches wgatectl's
  * desired state.
  *
@@ -38,35 +23,38 @@ bool wg_block_set_has (const wg_block_set_t *b, uint32_t ip);
  *   append a contiguous block of rules in this order — every one tagged
  *   with `-m comment --comment wgatectl`:
  *
- *     1. -i <lan> -m set --match-set wgate_allow dst -j ACCEPT
- *     2. -i <lan> -m set --match-set wgate_allow src -j ACCEPT
- *     3. -s <static_cidr> -j ACCEPT                   (if static_cidr != NULL/"")
- *     4. -i <lan> -s <ip>/32 -j ACCEPT                (per IP in `grants`, closed mode only)
- *     5. -s <ip>/32 -j DROP  (for each ip in `desired_drops`, sorted)
- *     6. -i <lan> -j DROP                             (if closed_mode)
+ *     1. -i <lan> -m set --match-set wgate_allow      dst -j ACCEPT
+ *     2. -s <static_cidr> -j ACCEPT                                       (if static_cidr)
+ *     3. -i <lan> -m set --match-set wgate_pin_open   src -j ACCEPT       (per-host pin → open)
+ *     4. -i <lan> -m set --match-set wgate_pin_closed src -j DROP         (per-host pin → closed)
+ *     5. -i <lan> -m set --match-set wgate_pin_filt   src \
+ *                 -m set --match-set wgate_filterd    dst -j DROP         (pin → filtered, drop matched)
+ *     6. -i <lan> -m set --match-set wgate_pin_filt   src -j ACCEPT       (pin → filtered, allow rest)
+ *     7. global mode:
+ *          closed   → -i <lan> -j DROP
+ *          filtered → -i <lan> -m set --match-set wgate_filterd dst -j DROP
+ *          open     → (no rule)
  *
- *   No trailing catch-all ACCEPT: FORWARD's default policy is ACCEPT,
- *   so anything that survives our block is already permitted; adding
- *   an explicit ACCEPT would mask admin-added DROPs below.
+ *   No trailing catch-all ACCEPT: FORWARD's default policy is ACCEPT, so
+ *   anything that survives our block is already permitted; appending
+ *   one would mask admin-added DROPs below.
  *
- *   Any previously-installed wgatectl rule (or legacy rule from before
- *   the comment tag existed) is removed before the fresh block is
- *   appended.
+ *   The FORWARD chain emission is stateless (no -m state ESTABLISHED,RELATED).
+ *   In-flight TCP fails through retransmission/RST when a pin or global
+ *   mode flips — accepted behaviour.
  *
- * `grants` is the set of host-order IPs that have an active timed-allow;
- * in closed mode we emit an explicit per-IP ACCEPT for each (pass NULL
- * or an empty set otherwise — the caller often does either).
+ *   Any previously-installed wgatectl rule (including legacy per-IP
+ *   DROPs in the LAN subnet from removed predecessors) is removed
+ *   before the fresh block is appended.
  *
- * `added` / `removed` receive the number of append / delete actions
- * that succeeded (pass NULL to skip). Returns 0 on success, -1 on
+ * `closed_mode` and `filtered_mode` are mutually exclusive (both false
+ * means "open"). They drive rule 7. Returns 0 on success, -1 on
  * fatal error (e.g. iptables binary unusable). */
 int iptables_reconcile(wg_iptables_t *t,
                        const char *lan_iface,
                        const char *static_cidr,
                        uint32_t net_addr, uint32_t net_mask,
-                       const wg_block_set_t *desired_drops,
-                       const wg_block_set_t *grants,
                        bool closed_mode,
-                       int *added, int *removed);
+                       bool filtered_mode);
 
 #endif
