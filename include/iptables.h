@@ -7,6 +7,13 @@
 
 typedef struct {
     char     iptables_bin[96];
+    /* Signature of the last successfully-applied desired state. When the
+     * next reconcile call computes the same signature, the whole
+     * delete-and-re-append pass is skipped — there is nothing to do, and
+     * the +0 -0 log lines were burying the lines that matter (real
+     * changes). 0 + have_last_sig=false means "never applied". */
+    uint64_t last_sig;
+    bool     have_last_sig;
 } wg_iptables_t;
 
 /* The set of LAN IPs that should be per-host DROPped (permanent blocks

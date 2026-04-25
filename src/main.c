@@ -21,6 +21,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
+#include <sys/stat.h>
 #include <sys/timerfd.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -66,6 +67,14 @@ typedef struct {
      * by POST /hosts/{k}/name. */
     int64_t          dnsmasq_reload_last_s;
     bool             dnsmasq_reload_pending;
+
+    /* Last-seen mtimes for the two dnsmasq sources. The minute flush
+     * stats both files; if either has changed since we last looked, we
+     * re-parse leases (and re-pin ARP if dnsmasq.conf itself moved).
+     * 0 means "never stat'd successfully" — stat failures don't trigger
+     * a reload, they just leave the previous value in place. */
+    time_t           dnsmasq_conf_mtime;
+    time_t           dnsmasq_leases_mtime;
 } wg_state_t;
 
 enum { TAG_TIMER = 1, TAG_SIGNAL, TAG_PCAP, TAG_IPC_LISTEN, TAG_IPC_CLIENT };
@@ -202,8 +211,52 @@ static void dnsmasq_reload_request_cb(void *arg) {
     dnsmasq_reload_request(arg);
 }
 
+/* Snapshot the current mtimes of both dnsmasq sources. A missing file
+ * is recorded as 0 — when it later appears, a 0→non-0 transition will
+ * count as a change and trigger a reload. */
+static void snapshot_dnsmasq_mtimes(wg_state_t *st) {
+    struct stat sb;
+    st->dnsmasq_conf_mtime =
+        (st->cfg.dnsmasq_conf[0]   && stat(st->cfg.dnsmasq_conf,   &sb) == 0)
+            ? sb.st_mtime : 0;
+    st->dnsmasq_leases_mtime =
+        (st->cfg.dnsmasq_leases[0] && stat(st->cfg.dnsmasq_leases, &sb) == 0)
+            ? sb.st_mtime : 0;
+}
+
+/* Once-a-minute check: did dnsmasq.conf or dnsmasq.leases change under
+ * us? Picks up manual edits (e.g. user adds dhcp-host= and restarts
+ * dnsmasq) without needing SIGHUP / POST /reload. ARP pins are only
+ * recomputed when dnsmasq.conf moved, since lease-file churn doesn't
+ * change static-zone membership. */
+static void check_dnsmasq_files(wg_state_t *st) {
+    struct stat sb;
+    time_t conf_mt = 0, leases_mt = 0;
+    if (st->cfg.dnsmasq_conf[0]   && stat(st->cfg.dnsmasq_conf,   &sb) == 0)
+        conf_mt = sb.st_mtime;
+    if (st->cfg.dnsmasq_leases[0] && stat(st->cfg.dnsmasq_leases, &sb) == 0)
+        leases_mt = sb.st_mtime;
+
+    bool conf_changed   = conf_mt   && conf_mt   != st->dnsmasq_conf_mtime;
+    bool leases_changed = leases_mt && leases_mt != st->dnsmasq_leases_mtime;
+    if (!conf_changed && !leases_changed) return;
+
+    LOG_I("dnsmasq files changed (conf=%d leases=%d): reloading",
+          conf_changed, leases_changed);
+    leases_reload(&st->leases, st->cfg.dnsmasq_conf,
+                  st->cfg.dnsmasq_leases, st->cfg.static_cidr);
+    if (conf_changed) arp_bind_apply(&st->ab, &st->leases);
+    st->dnsmasq_conf_mtime   = conf_mt;
+    st->dnsmasq_leases_mtime = leases_mt;
+    reconcile_request(st);
+}
+
 static void do_minute_flush(wg_state_t *st) {
     int64_t now = now_wall_s();
+
+    /* pick up out-of-band edits to dnsmasq.conf / dnsmasq.leases before
+     * any decision based on `leases` runs this minute */
+    check_dnsmasq_files(st);
 
     /* drop expired overrides/grants before evaluation */
     schedule_tick(st->sched, now);
@@ -245,19 +298,26 @@ static void do_minute_flush(wg_state_t *st) {
         bool entering_permissive =
             st->have_last_mode &&
             (mode == SCH_MODE_SUPERVISED || mode == SCH_MODE_OPEN);
-        if (entering_permissive && st->blocks.n > 0) {
-            for (size_t i = 0; i < st->blocks.n; i++) {
-                const wg_block_item_t *it = &st->blocks.items[i];
-                uint32_t ip;
-                char ipbuf[16] = "";
-                if (blocks_resolve_ip(&st->leases, it->key, &ip))
-                    ip_format(ip, ipbuf);
-                metrics_emit_control(st->jl, now, it->key,
-                                     ipbuf[0] ? ipbuf : NULL,
-                                     "allow", "auto-open");
+        if (entering_permissive) {
+            if (st->blocks.n > 0) {
+                for (size_t i = 0; i < st->blocks.n; i++) {
+                    const wg_block_item_t *it = &st->blocks.items[i];
+                    uint32_t ip;
+                    char ipbuf[16] = "";
+                    if (blocks_resolve_ip(&st->leases, it->key, &ip))
+                        ip_format(ip, ipbuf);
+                    metrics_emit_control(st->jl, now, it->key,
+                                         ipbuf[0] ? ipbuf : NULL,
+                                         "allow", "auto-open");
+                }
+                blocks_clear(&st->blocks);
+                blocks_save(&st->blocks);
             }
-            blocks_clear(&st->blocks);
-            blocks_save(&st->blocks);
+            /* Carrying yesterday's supervised triggers into a new day
+             * would re-block devices the moment supervised mode kicks
+             * in — same morning-fresh-start intent as the blocks.json
+             * sweep above. */
+            supervisor_clear_triggers(st->sup);
             reconcile_request(st);
         }
 
@@ -304,6 +364,7 @@ static int init_all(wg_state_t *st, const char *conf_override) {
     leases_init(&st->leases);
     leases_reload(&st->leases, st->cfg.dnsmasq_conf, st->cfg.dnsmasq_leases,
                   st->cfg.static_cidr);
+    snapshot_dnsmasq_mtimes(st);
 
     arp_bind_init(&st->ab, st->cfg.ip_bin, st->cfg.iface, st->cfg.static_cidr);
     arp_bind_apply(&st->ab, &st->leases);
@@ -446,6 +507,7 @@ static void on_signal(wg_state_t *st) {
             LOG_I("SIGHUP: reloading dnsmasq.conf + schedule + supervised");
             leases_reload(&st->leases, st->cfg.dnsmasq_conf,
                           st->cfg.dnsmasq_leases, st->cfg.static_cidr);
+            snapshot_dnsmasq_mtimes(st);
             arp_bind_apply(&st->ab, &st->leases);
             schedule_load(st->sched);
             supervisor_load(st->sup);

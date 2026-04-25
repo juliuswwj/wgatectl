@@ -201,6 +201,73 @@ static int cmp_u32(const void *a, const void *b) {
     return 0;
 }
 
+/* FNV-1a 64. Used only for the desired-state cache; not security-sensitive. */
+static uint64_t fnv1a64(const void *buf, size_t n, uint64_t hash) {
+    const uint8_t *p = buf;
+    for (size_t i = 0; i < n; i++) {
+        hash ^= p[i];
+        hash *= 0x100000001b3ULL;
+    }
+    return hash;
+}
+
+/* Hash everything that affects the rules pass 2 emits, so that an
+ * identical desired state collapses to a no-op in iptables_reconcile.
+ * Per-IP sets are filtered through the same ip_in_subnet test that
+ * pass 2 applies, so out-of-subnet entries don't bust the cache. */
+static uint64_t compute_desired_sig(const char *lan_iface,
+                                    const char *static_cidr,
+                                    uint32_t net_addr, uint32_t net_mask,
+                                    const wg_block_set_t *desired,
+                                    const wg_block_set_t *grants,
+                                    bool closed_mode) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    uint8_t flag = closed_mode ? 1 : 0;
+    h = fnv1a64(&flag, 1, h);
+    if (lan_iface)   h = fnv1a64(lan_iface,   strlen(lan_iface),   h);
+    h = fnv1a64("|", 1, h);
+    if (static_cidr) h = fnv1a64(static_cidr, strlen(static_cidr), h);
+    h = fnv1a64("|", 1, h);
+    h = fnv1a64(&net_addr, sizeof(net_addr), h);
+    h = fnv1a64(&net_mask, sizeof(net_mask), h);
+    h = fnv1a64("|", 1, h);
+
+    if (desired && desired->n) {
+        uint32_t *sorted = malloc(desired->n * sizeof(*sorted));
+        if (sorted) {
+            size_t k = 0;
+            for (size_t i = 0; i < desired->n; i++) {
+                uint32_t ip = desired->blocked_ips[i];
+                if (!ip_in_subnet(ip, net_addr, net_mask)) continue;
+                sorted[k++] = ip;
+            }
+            qsort(sorted, k, sizeof(*sorted), cmp_u32);
+            h = fnv1a64(sorted, k * sizeof(*sorted), h);
+            free(sorted);
+        }
+    }
+    h = fnv1a64("|", 1, h);
+
+    /* Grants only emit rules in closed mode (rule 4). In other modes
+     * they have no effect on FORWARD, so leave them out of the
+     * signature to avoid re-applying when only a grant changed. */
+    if (closed_mode && grants && grants->n) {
+        uint32_t *sorted = malloc(grants->n * sizeof(*sorted));
+        if (sorted) {
+            size_t k = 0;
+            for (size_t i = 0; i < grants->n; i++) {
+                uint32_t ip = grants->blocked_ips[i];
+                if (!ip_in_subnet(ip, net_addr, net_mask)) continue;
+                sorted[k++] = ip;
+            }
+            qsort(sorted, k, sizeof(*sorted), cmp_u32);
+            h = fnv1a64(sorted, k * sizeof(*sorted), h);
+            free(sorted);
+        }
+    }
+    return h;
+}
+
 int iptables_reconcile(wg_iptables_t *t,
                        const char *lan_iface,
                        const char *static_cidr,
@@ -210,6 +277,21 @@ int iptables_reconcile(wg_iptables_t *t,
                        bool closed_mode,
                        int *added, int *removed) {
     const char *bin = t->iptables_bin;
+
+    /* Skip the entire fork-iptables-S + delete + re-append dance when the
+     * desired state matches what we last applied. Trade-off: external
+     * tampering (someone manually flushes our rules) won't auto-heal
+     * until the next real change — acceptable on a single-tenant
+     * gateway, and worth it to keep the log free of per-minute +N -N
+     * noise that buries actual state changes. */
+    uint64_t sig = compute_desired_sig(lan_iface, static_cidr,
+                                       net_addr, net_mask,
+                                       desired, grants, closed_mode);
+    if (t->have_last_sig && sig == t->last_sig) {
+        if (added)   *added   = 0;
+        if (removed) *removed = 0;
+        return 0;
+    }
 
     /* --- pass 1: list FORWARD and delete every rule that's ours --- */
     static char buf[128 * 1024];
@@ -328,5 +410,7 @@ int iptables_reconcile(wg_iptables_t *t,
     if (removed) *removed = nr;
     if (na || nr)
         LOG_I("iptables: +%d -%d (mode=%s)", na, nr, closed_mode ? "closed" : "open/supervised");
+    t->last_sig      = sig;
+    t->have_last_sig = true;
     return 0;
 }

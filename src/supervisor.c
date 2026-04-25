@@ -467,6 +467,53 @@ int supervisor_add_target(wg_supervisor_t *s, const char *domain) {
     return 1;
 }
 
+int supervisor_remove_trigger(wg_supervisor_t *s, const wg_leases_t *leases,
+                              const char *key) {
+    if (!s || !key) return 0;
+    uint32_t target_ip = 0;
+    bool have_ip = blocks_resolve_ip(leases, key, &target_ip);
+
+    int removed = 0;
+    size_t w = 0;
+    for (size_t r = 0; r < s->n_triggers; r++) {
+        const sup_trigger_t *t = &s->triggers[r];
+        bool match = false;
+        if (have_ip) {
+            uint32_t tip;
+            if (blocks_resolve_ip(leases, t->key, &tip) && tip == target_ip)
+                match = true;
+        }
+        if (!match && strcmp(t->key, key) == 0) match = true;
+        if (match) {
+            uint32_t kip;
+            if (blocks_resolve_ip(leases, t->key, &kip))
+                reset_counter_for_ip(s, kip);
+            removed++;
+            s->dirty_triggers = true;
+            continue;
+        }
+        if (w != r) s->triggers[w] = *t;
+        w++;
+    }
+    s->n_triggers = w;
+    if (removed) supervisor_save(s);
+    return removed > 0 ? 1 : 0;
+}
+
+void supervisor_clear_triggers(wg_supervisor_t *s) {
+    if (!s) return;
+    if (s->n_triggers == 0 && s->n_counters == 0) return;
+    if (s->n_triggers > 0) {
+        s->n_triggers = 0;
+        s->dirty_triggers = true;
+    }
+    for (size_t i = 0; i < s->n_counters; i++) {
+        s->counters[i].consec        = 0;
+        s->counters[i].matched_bytes = 0;
+    }
+    supervisor_save(s);
+}
+
 int supervisor_remove_target(wg_supervisor_t *s, const char *domain) {
     if (!s || !domain) return 0;
     char *lo = dup_lower(domain);

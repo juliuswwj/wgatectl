@@ -8,9 +8,12 @@
 #include "supervisor.h"
 #include "util.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <net/if.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +22,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define IPC_MAX_CLIENTS   16
@@ -398,14 +402,15 @@ static void handle_host_allow(wg_ipc_t *ipc, client_t *c, const char *key) {
         if (minutes > 0) until = now + (int64_t)minutes * 60;
     }
 
-    int block_removed = blocks_remove(app->blocks, app->leases, key);
-    int grant_added   = 0;
+    int block_removed   = blocks_remove(app->blocks, app->leases, key);
+    int trigger_removed = supervisor_remove_trigger(app->sup, app->leases, key);
+    int grant_added     = 0;
     if (until > now) {
         grant_added = schedule_grant_add_until(app->sched, app->leases, key,
                                                until, reason);
     }
 
-    if (block_removed || grant_added) {
+    if (block_removed || trigger_removed || grant_added) {
         if (block_removed) blocks_save(app->blocks);
         do_reconcile(app);
         char ipbuf[16] = "";
@@ -420,7 +425,8 @@ static void handle_host_allow(wg_ipc_t *ipc, client_t *c, const char *key) {
     json_kbool(&j, "ok", true);
     json_kstr (&j, "host", key);
     json_kbool(&j, "blocked", false);
-    json_kbool(&j, "changed", (block_removed || grant_added) != 0);
+    json_kbool(&j, "changed",
+               (block_removed || trigger_removed || grant_added) != 0);
     if (until > now) json_ki64(&j, "until", until);
     if (reason && *reason) json_kstr(&j, "reason", reason);
     json_obj_end(&j);
@@ -759,6 +765,150 @@ static void handle_reload(wg_ipc_t *ipc, client_t *c) {
     respond_simple(c, 200, NULL);
 }
 
+/* -------------------- pve status / wake -------------------- */
+
+/* /pve probes pve, mint, and twin via parallel `ping -c 1 -W 1`. The
+ * names are looked up in the leases table (dnsmasq sees them as static
+ * hosts). pve is the Proxmox box; mint and twin are GPU-passthrough VMs
+ * that share the GPU and so are mutually exclusive. */
+static const char *const PVE_PROBE_NAMES[] = { "pve", "mint", "twin" };
+#define PVE_PROBE_N ((int)(sizeof(PVE_PROBE_NAMES) / sizeof(PVE_PROBE_NAMES[0])))
+
+static void handle_pve_status(wg_ipc_t *ipc, client_t *c) {
+    const wg_leases_t *leases = ipc->app->leases;
+
+    char ipbuf[PVE_PROBE_N][16];
+    pid_t pids[PVE_PROBE_N] = { 0 };
+    int   up  [PVE_PROBE_N] = { 0 };
+    int   has [PVE_PROBE_N] = { 0 };
+
+    for (int i = 0; i < PVE_PROBE_N; i++) {
+        const wg_lease_t *l = leases_by_name(leases, PVE_PROBE_NAMES[i]);
+        if (!l) continue;
+        has[i] = 1;
+        ip_format(l->ip, ipbuf[i]);
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            LOG_W("pve: fork: %s", strerror(errno));
+            continue;
+        }
+        if (pid == 0) {
+            char cmd[96];
+            snprintf(cmd, sizeof(cmd),
+                     "exec ping -c 1 -W 1 -n -q %s >/dev/null 2>&1",
+                     ipbuf[i]);
+            execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+            _exit(127);
+        }
+        pids[i] = pid;
+    }
+
+    for (int i = 0; i < PVE_PROBE_N; i++) {
+        if (!pids[i]) continue;
+        int status = 0;
+        while (waitpid(pids[i], &status, 0) < 0) {
+            if (errno != EINTR) break;
+        }
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) up[i] = 1;
+    }
+
+    json_out_t j;
+    json_out_init(&j);
+    json_obj_begin(&j);
+    json_kbool(&j, "ok", true);
+    json_key(&j, "hosts");
+    json_arr_begin(&j);
+    for (int i = 0; i < PVE_PROBE_N; i++) {
+        json_obj_begin(&j);
+        json_kstr(&j, "name", PVE_PROBE_NAMES[i]);
+        if (has[i]) {
+            json_kstr(&j, "ip", ipbuf[i]);
+            json_kstr(&j, "status", up[i] ? "up" : "down");
+        } else {
+            json_knull(&j, "ip");
+            json_kstr(&j, "status", "unknown");
+        }
+        json_obj_end(&j);
+    }
+    json_arr_end(&j);
+    json_obj_end(&j);
+    respond_json(c, 200, &j);
+    json_out_free(&j);
+}
+
+/* Built-in WoL: 6 x 0xFF + 16 x MAC, sent as UDP/9 to the LAN broadcast.
+ * Bound to the LAN iface so the packet definitely leaves the right NIC
+ * regardless of routing table state. */
+static void handle_pve_wake(wg_ipc_t *ipc, client_t *c) {
+    const wg_cfg_t *cfg = ipc->app->cfg;
+
+    if (cfg->pve_mac[0] == 0) {
+        respond_simple(c, 400, "WG_PVE_MAC not set");
+        return;
+    }
+    uint8_t mac[6];
+    if (!mac_parse(cfg->pve_mac, mac)) {
+        respond_simple(c, 400, "invalid WG_PVE_MAC");
+        return;
+    }
+
+    uint8_t pkt[6 + 16 * 6];
+    memset(pkt, 0xFF, 6);
+    for (int i = 0; i < 16; i++) memcpy(pkt + 6 + i * 6, mac, 6);
+
+    int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (s < 0) { respond_simple(c, 500, strerror(errno)); return; }
+
+    int yes = 1;
+    if (setsockopt(s, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes)) < 0) {
+        int e = errno; close(s);
+        respond_simple(c, 500, strerror(e));
+        return;
+    }
+    if (cfg->iface[0]) {
+        if (setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE,
+                       cfg->iface, (socklen_t)strlen(cfg->iface)) < 0) {
+            LOG_W("pve wake: SO_BINDTODEVICE %s: %s",
+                  cfg->iface, strerror(errno));
+            /* fall through; routing should still pick the right iface */
+        }
+    }
+
+    uint32_t bcast = cfg->net_addr | ~cfg->net_mask;
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    to.sin_family      = AF_INET;
+    to.sin_port        = htons(9);
+    to.sin_addr.s_addr = htonl(bcast);
+
+    ssize_t n = sendto(s, pkt, sizeof(pkt), 0,
+                       (struct sockaddr *)&to, sizeof(to));
+    int saved = errno;
+    close(s);
+    if (n != (ssize_t)sizeof(pkt)) {
+        respond_simple(c, 500, strerror(saved));
+        return;
+    }
+
+    char macbuf[18], bcbuf[16];
+    mac_format(mac, macbuf);
+    ip_format(bcast, bcbuf);
+    LOG_I("pve wake: sent magic packet to %s via %s on %s",
+          macbuf, bcbuf, cfg->iface);
+
+    json_out_t j;
+    json_out_init(&j);
+    json_obj_begin(&j);
+    json_kbool(&j, "ok", true);
+    json_kstr (&j, "mac",       macbuf);
+    json_kstr (&j, "broadcast", bcbuf);
+    json_kstr (&j, "iface",     cfg->iface);
+    json_obj_end(&j);
+    respond_json(c, 200, &j);
+    json_out_free(&j);
+}
+
 /* -------------------- route dispatch -------------------- */
 
 static void dispatch(wg_ipc_t *ipc, client_t *c) {
@@ -770,6 +920,7 @@ static void dispatch(wg_ipc_t *ipc, client_t *c) {
 
     if (strcmp(m, "GET") == 0) {
         if (strcmp(p, "/status")       == 0) { handle_status(ipc, c);       return; }
+        if (strcmp(p, "/pve")          == 0) { handle_pve_status(ipc, c);   return; }
         if (strcmp(p, "/hosts")        == 0) { handle_hosts(ipc, c);        return; }
         if (strcmp(p, "/schedule")     == 0) { handle_schedule_get(ipc, c); return; }
         if (strcmp(p, "/supervised")   == 0) { handle_supervised_list(ipc, c); return; }
@@ -791,7 +942,8 @@ static void dispatch(wg_ipc_t *ipc, client_t *c) {
         if (path_suffix(p, "/supervised/", suffix, sizeof(suffix))) {
             handle_supervised_add(ipc, c, suffix); return;
         }
-        if (strcmp(p, "/reload") == 0) { handle_reload(ipc, c); return; }
+        if (strcmp(p, "/reload")   == 0) { handle_reload(ipc, c);   return; }
+        if (strcmp(p, "/pve/wake") == 0) { handle_pve_wake(ipc, c); return; }
         respond_simple(c, 404, "no such route");
         return;
     }

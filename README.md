@@ -66,6 +66,9 @@ Three dhcp-range modes:
   whose traffic includes any domain listed in `supervised.json` for **5
   consecutive minutes** gets fully blocked for **1 hour**; after the hour is
   up, the counter resets (another 5 straight minutes are required to re-fire).
+  Triggers also clear on the next mode transition into supervised/open
+  (same morning-fresh-start sweep that empties `blocks.json`), and on any
+  `POST /hosts/{key}/allow` for the affected device.
 - **open** (全开) — mode contributes no blocks; only `blocks.json` applies.
 
 Default weekly base (local time):
@@ -91,7 +94,9 @@ Per-device **block / allow** semantics:
   There is no permanent block; use a block to mean "pause until
   naturally reopened".
 - `POST /hosts/{key}/allow?reason=...` — immediately undo the block.
-  No time parameter, pure unblock.
+  No time parameter, pure unblock.  Also drops any active supervisor
+  trigger for the same device, so the per-host DROP doesn't reappear
+  on the next reconcile.
 - `POST /hosts/{key}/allow?minutes=N[&reason=...]` or `?until=<epoch>` —
   unblock **and** install a timed grant that punches through closed-mode
   too, i.e., the device stays online for N minutes even if the schedule
@@ -129,6 +134,9 @@ curl --unix-socket /opt/wgatectl/wgatectl.sock -XDELETE http://x/supervised/epic
 
 curl --unix-socket /opt/wgatectl/wgatectl.sock 'http://x/metrics/tail?since=0'
 curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST http://x/reload
+
+curl --unix-socket /opt/wgatectl/wgatectl.sock http://x/pve | jq .
+curl --unix-socket /opt/wgatectl/wgatectl.sock -XPOST http://x/pve/wake
 ```
 
 Routes:
@@ -149,7 +157,9 @@ Routes:
 | POST   | `/supervised/{domain}`            | add target                                              |
 | DELETE | `/supervised/{domain}`            | remove target                                           |
 | GET    | `/metrics/tail?since=<ts>`        | NDJSON tail of today's event file                       |
-| POST   | `/reload`                         | re-read dnsmasq.conf, `schedule.json`, `supervised.json` |
+| POST   | `/reload`                         | re-read dnsmasq.conf, `schedule.json`, `supervised.json` (also runs automatically when `dnsmasq.conf` / `dnsmasq.leases` mtime changes) |
+| GET    | `/pve`                            | parallel `ping` of `pve` / `mint` / `twin` (looked up in leases) — each entry is `up`, `down`, or `unknown` |
+| POST   | `/pve/wake`                       | send a WoL magic packet to `WG_PVE_MAC` on the LAN broadcast (UDP/9) |
 
 Endpoints that don't need a body accept bodyless requests (as before).
 `POST /schedule/override` is the only endpoint that *requires* a JSON
@@ -199,6 +209,14 @@ appends a fresh, contiguous block at the tail.  External rules
 with `-m comment --comment wgatectl`, which is what lets us identify
 ours without clashing.
 
+A per-state signature is cached, so when the desired set is unchanged
+the entire `iptables -S FORWARD` + delete + re-append pass is skipped.
+The `iptables: +N -M` log line therefore only appears when something
+real changed (block/allow, override, trigger fired/expired, mode
+edge).  The downside: external tampering — e.g. someone manually
+flushing FORWARD — is not auto-healed until the next real change or a
+`POST /reload`.
+
 The tail of FORWARD (after external rules) looks like:
 
 ```
@@ -242,8 +260,11 @@ replace … nud permanent`.  For each IP inside the CIDR:
   traffic to it black-holes.
 
 `dhcp-host` entries whose IP falls outside the CIDR are pinned too for
-defense-in-depth.  Bindings are refreshed on startup, SIGHUP, and after
-`POST /reload`; on graceful shutdown they are removed.
+defense-in-depth.  Bindings are refreshed on startup, SIGHUP, after
+`POST /reload`, and automatically when `dnsmasq.conf`'s mtime changes
+(picked up at the next minute boundary, so external edits + a dnsmasq
+restart don't need a manual signal).  On graceful shutdown they are
+removed.
 
 ## Tests
 

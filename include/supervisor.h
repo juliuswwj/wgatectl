@@ -82,6 +82,20 @@ size_t supervisor_triggered_ips(const wg_supervisor_t *s,
 int  supervisor_add_target   (wg_supervisor_t *s, const char *domain);
 int  supervisor_remove_target(wg_supervisor_t *s, const char *domain);
 
+/* Drop any active trigger that resolves to the same IP as `key` (or
+ * matches it textually if it doesn't resolve), and reset the per-IP
+ * counter so the device re-arms cleanly. Returns 1 if anything was
+ * removed, 0 otherwise. Used by POST /hosts/<key>/allow so that
+ * unblocking a supervised-mode trigger really sticks. */
+int  supervisor_remove_trigger(wg_supervisor_t *s,
+                               const wg_leases_t *leases,
+                               const char *key);
+
+/* Wipe the entire trigger list and zero all per-IP counters. Used on
+ * mode transition into a permissive mode so devices get a fresh start
+ * (matches the same intent as the blocks.json auto-clear). */
+void supervisor_clear_triggers(wg_supervisor_t *s);
+
 /* Dumps for HTTP. */
 void supervisor_dump_json    (const wg_supervisor_t *s, int64_t now_wall,
                               json_out_t *j);

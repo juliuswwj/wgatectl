@@ -136,6 +136,26 @@ int main(void) {
         tc += 60;
     }
     assert(supervisor_ip_triggered(s, &leases, ip_a, tc) == true);
+
+    /* supervisor_remove_trigger: clears the trigger for this IP and
+     * resets the per-IP counter so a re-arm starts from zero. */
+    assert(supervisor_remove_trigger(s, &leases, "10.6.6.5") == 1);
+    assert(supervisor_ip_triggered(s, &leases, ip_a, tc) == false);
+    assert(supervisor_remove_trigger(s, &leases, "10.6.6.5") == 0); /* idempotent */
+
+    /* Re-trigger from scratch: counter must have been reset, so two
+     * fresh matched minutes with threshold=2 fire again. */
+    for (int i = 0; i < 2; i++) {
+        supervisor_observe(s, ip_a, "w.a.com", 3000);
+        supervisor_observe(s, ip_a, "w.b.com", 3000);
+        supervisor_commit_minute(s, &leases, NULL, tc);
+        tc += 60;
+    }
+    assert(supervisor_ip_triggered(s, &leases, ip_a, tc) == true);
+
+    /* supervisor_clear_triggers wipes everything in one shot. */
+    supervisor_clear_triggers(s);
+    assert(supervisor_ip_triggered(s, &leases, ip_a, tc) == false);
     supervisor_free(s);
 
     printf("OK test_supervisor\n");
