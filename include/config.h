@@ -43,6 +43,11 @@ typedef struct {
      * /bin/sh -c, coalesced to one invocation per 5 s. */
     char     dnsmasq_reload_cmd[128];
 
+    /* MAC address of the Proxmox host. POST /pve/wake sends a WoL magic
+     * packet to the LAN broadcast (port 9) targeting this MAC. Empty
+     * disables the endpoint. */
+    char     pve_mac[18];
+
     int      flush_seconds;         /* default 60 */
 
     /* Supervisor tuning. threshold_min / cooldown_min are minutes;

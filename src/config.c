@@ -68,6 +68,7 @@ static void apply_kv(wg_cfg_t *c, const char *k, const char *v) {
     else if (!strcmp(k, "WG_IPSET_BIN"))       set_str(c->ipset_bin,      sizeof(c->ipset_bin),      v);
     else if (!strcmp(k, "WG_IP_BIN"))          set_str(c->ip_bin,         sizeof(c->ip_bin),         v);
     else if (!strcmp(k, "WG_DNSMASQ_RELOAD_CMD")) set_str(c->dnsmasq_reload_cmd, sizeof(c->dnsmasq_reload_cmd), v);
+    else if (!strcmp(k, "WG_PVE_MAC"))         set_str(c->pve_mac,        sizeof(c->pve_mac),        v);
     else if (!strcmp(k, "WG_STATIC_CIDR"))     set_str(c->static_cidr,    sizeof(c->static_cidr),    v);
     else if (!strcmp(k, "WG_FLUSH_SECONDS"))   set_int(&c->flush_seconds, v);
     else if (!strcmp(k, "WG_SUPERVISED_THRESHOLD_MIN")) set_int(&c->supervised_threshold_min, v);
@@ -117,6 +118,7 @@ static void load_env(wg_cfg_t *c) {
         "WG_SOCK", "WG_SOCK_GROUP",
         "WG_IPTABLES_BIN", "WG_IPSET_BIN", "WG_IP_BIN", "WG_STATIC_CIDR",
         "WG_DNSMASQ_RELOAD_CMD",
+        "WG_PVE_MAC",
         "WG_FLUSH_SECONDS",
         "WG_SUPERVISED_THRESHOLD_MIN", "WG_SUPERVISED_COOLDOWN_MIN",
         "WG_SUPERVISED_MIN_BYTES_PER_MIN",

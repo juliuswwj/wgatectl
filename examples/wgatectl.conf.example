@@ -77,6 +77,11 @@ WG_IP_BIN=/sbin/ip
 # to one invocation per 5 s, same debounce window as iptables.
 WG_DNSMASQ_RELOAD_CMD=systemctl restart dnsmasq
 
+# MAC address of the Proxmox host. POST /pve/wake sends a wake-on-LAN
+# magic packet to the LAN broadcast (UDP port 9) targeting this MAC.
+# Leave unset to disable the /pve/wake endpoint.
+# WG_PVE_MAC=aa:bb:cc:dd:ee:ff
+
 # Metrics flush cadence.  The main tick fires every second; this knob
 # controls the JSONL flush period and iptables self-heal reconcile.
 WG_FLUSH_SECONDS=60
