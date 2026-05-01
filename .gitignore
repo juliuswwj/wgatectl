@@ -5,10 +5,8 @@
 
 # Compiled binaries
 /wgatectl
-/tests/test_schedule
-/tests/test_filterd
-/tests/test_pins
-/tests/test_dnsmasq_conf
+/tests/test_*
+!/tests/test_*.c
 
 # Crash dumps
 /core
