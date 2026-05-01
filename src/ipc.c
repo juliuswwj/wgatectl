@@ -245,7 +245,7 @@ static char *query_get(const char *qs, const char *key) {
 
 /* -------------------- iptables-reconcile after change ----------------- */
 
-/* Ask the supervisor loop in main.c to re-apply iptables. The callback
+/* Ask the main loop to re-apply iptables. The callback
  * is expected to coalesce requests (at most one actual iptables pass
  * every few seconds) so that an API spammer cannot flood the netfilter
  * fast path. */
