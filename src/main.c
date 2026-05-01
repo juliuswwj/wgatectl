@@ -10,6 +10,7 @@
 #include "metrics.h"
 #include "pins.h"
 #include "schedule.h"
+#include "seen_db.h"
 #include "sniffer.h"
 #include "util.h"
 
@@ -45,6 +46,7 @@ typedef struct {
     wg_schedule_t   *sched;
     wg_filterd_t    *filterd;
     wg_pins_t       *pins;
+    wg_seen_db_t    *seen;
     wg_sniffer_t    *sniffer;
     wg_ipc_t        *ipc;
     wg_ipc_app_t     app;
@@ -115,6 +117,22 @@ static void release_client_ref(int fd) {
 static int ep_add(int epfd, int fd, uint32_t events, void *ptr) {
     struct epoll_event ev = { .events = events, .data = { .ptr = ptr } };
     return epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+}
+
+/* leases.c invokes this for every (mac,ip) that appeared or disappeared
+ * in dnsmasq.leases between consecutive leases_reload() calls. We fan it
+ * out to the JSONL stream as a kind="lease" event so the agent's
+ * /metrics/tail consumer can pick it up. */
+static void lease_change_cb(void *arg, bool added,
+                            const uint8_t mac[6], uint32_t ip,
+                            const char *name, const char *reason) {
+    wg_state_t *st = arg;
+    char macbuf[18], ipbuf[16];
+    mac_format(mac, macbuf);
+    ip_format(ip, ipbuf);
+    metrics_emit_lease(st->jl, now_wall_s(),
+                       added ? "add" : "remove",
+                       macbuf, ipbuf, name, reason);
 }
 
 /* Actually run iptables reconcile. Called either directly from code paths
@@ -260,6 +278,10 @@ static void do_minute_flush(wg_state_t *st) {
 
     jsonl_sync(st->jl);
 
+    /* Persist any first_seen/last_seen bumps observed this minute. The
+     * save is a no-op when nothing changed. */
+    if (st->seen && seen_db_dirty(st->seen)) seen_db_save(st->seen);
+
     /* emit a control event when the mode transitions */
     if (!st->have_last_mode || mode != st->last_mode) {
         if (st->have_last_mode) {
@@ -307,8 +329,17 @@ static int init_all(wg_state_t *st, const char *conf_override) {
     logger_init(0);
 
     leases_init(&st->leases);
+    /* seen-db must be wired BEFORE the initial leases_reload so that
+     * first_seen/last_seen are populated for every host on /hosts from
+     * the very first request; the lease-change callback is wired
+     * AFTER, so that startup doesn't emit a spurious "add" event for
+     * every lease already in dnsmasq.leases. */
+    st->seen = seen_db_open(st->cfg.hosts_db_json);
+    if (!st->seen) return -1;
+    leases_set_seen_db(&st->leases, st->seen);
     leases_reload(&st->leases, st->cfg.dnsmasq_conf, st->cfg.dnsmasq_leases,
                   st->cfg.static_cidr);
+    leases_set_change_cb(&st->leases, lease_change_cb, st);
     snapshot_dnsmasq_mtimes(st);
 
     arp_bind_init(&st->ab, st->cfg.ip_bin, st->cfg.iface, st->cfg.static_cidr);
@@ -539,6 +570,7 @@ static void shutdown_all(wg_state_t *st) {
     if (st->sched)   schedule_save(st->sched);
     if (st->filterd) filterd_save(st->filterd);
     if (st->pins)    pins_save(st->pins);
+    if (st->seen)    seen_db_save(st->seen);
 
     if (st->ipc)     ipc_close(st->ipc);
     if (st->sniffer) sniffer_close(st->sniffer);
@@ -549,6 +581,7 @@ static void shutdown_all(wg_state_t *st) {
     if (st->sched)   schedule_free(st->sched);
     if (st->filterd) filterd_free(st->filterd);
     if (st->pins)    pins_free(st->pins);
+    if (st->seen)    seen_db_close(st->seen);
 
     arp_bind_shutdown(&st->ab);
     arp_bind_free(&st->ab);

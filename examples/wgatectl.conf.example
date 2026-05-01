@@ -36,6 +36,11 @@ WG_PINS_JSON=/opt/wgatectl/pins.json
 # to filterd.json to silence the message.
 WG_SUPERVISED_JSON=/opt/wgatectl/supervised.json
 
+# Persistent first_seen / last_seen by MAC.  Powers the
+# `first_seen_unix` / `last_seen_unix` fields on GET /hosts so the
+# daemon can answer "when did we first see this device?" across restarts.
+WG_HOSTS_DB_JSON=/opt/wgatectl/hosts.json
+
 # Where the per-minute JSONL events go.  Files are named events-YYYYMMDD.jsonl.
 # The daemon creates this directory if it doesn't exist.
 WG_JSONL_DIR=/opt/wgatectl

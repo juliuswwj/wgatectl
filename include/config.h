@@ -23,6 +23,10 @@ typedef struct {
     char     filterd_json   [256];  /* /opt/wgatectl/filterd.json */
     char     pins_json      [256];  /* /opt/wgatectl/pins.json */
     char     supervised_json[256];  /* /opt/wgatectl/supervised.json (legacy, one-shot import) */
+    /* Persistent first_seen / last_seen by MAC. Survives daemon
+     * restarts so that "when did we first see this device?" is a real
+     * answer rather than "since this boot". */
+    char     hosts_db_json  [256];  /* /opt/wgatectl/hosts.json */
 
     /* Output */
     char     jsonl_dir      [256];  /* /var/log/wgatectl */

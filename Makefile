@@ -28,6 +28,7 @@ SRC := \
   src/util.c         \
   src/jsonl.c        \
   src/leases.c       \
+  src/seen_db.c      \
   src/ipset_mgr.c    \
   src/iptables.c     \
   src/arp_bind.c     \
@@ -54,6 +55,7 @@ TEST_CORE_OBJ := \
   src/util.o        \
   src/jsonl.o       \
   src/leases.o      \
+  src/seen_db.o     \
   src/ipset_mgr.o   \
   src/iptables.o    \
   src/arp_bind.o    \
@@ -64,7 +66,7 @@ TEST_CORE_OBJ := \
   src/dnsmasq_conf.o \
   src/json.o
 
-TEST_BINS := tests/test_schedule tests/test_pins tests/test_filterd tests/test_dnsmasq_conf
+TEST_BINS := tests/test_schedule tests/test_pins tests/test_filterd tests/test_dnsmasq_conf tests/test_seen_db
 
 .PHONY: all clean install asan test
 
@@ -88,6 +90,9 @@ tests/test_filterd: tests/test_filterd.c $(TEST_CORE_OBJ)
 tests/test_dnsmasq_conf: tests/test_dnsmasq_conf.c $(TEST_CORE_OBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(TEST_CORE_OBJ) $(LDFLAGS) $(LDLIBS)
 
+tests/test_seen_db: tests/test_seen_db.c $(TEST_CORE_OBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(TEST_CORE_OBJ) $(LDFLAGS) $(LDLIBS)
+
 asan:
 	$(MAKE) clean
 	$(MAKE) CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -std=c11 -D_GNU_SOURCE $(WARN) $(PCAP_CFLAGS) -Iinclude" \
@@ -99,6 +104,7 @@ test: $(TEST_BINS)
 	tests/test_pins
 	tests/test_filterd
 	tests/test_dnsmasq_conf
+	tests/test_seen_db
 
 install: $(BIN)
 	install -d $(DESTDIR)$(SBINDIR)

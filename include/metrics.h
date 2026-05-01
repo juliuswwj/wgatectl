@@ -39,4 +39,12 @@ void metrics_emit_control(jsonl_t *jl, int64_t ts_secs,
                           const char *name, const char *ip_str,
                           const char *action, const char *reason);
 
+/* Emit a kind="lease" event whenever a dnsmasq lease appears or
+ * disappears. `action` is "add" or "remove"; `reason` is optional and
+ * only meaningful for removes ("expired" / "released" / "replaced"). */
+void metrics_emit_lease(jsonl_t *jl, int64_t ts_secs,
+                        const char *action,
+                        const char *mac_str, const char *ip_str,
+                        const char *name, const char *reason);
+
 #endif

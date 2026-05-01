@@ -381,6 +381,27 @@ void metrics_emit_control(jsonl_t *jl, int64_t ts_secs,
     json_out_free(&j);
 }
 
+void metrics_emit_lease(jsonl_t *jl, int64_t ts_secs,
+                        const char *action,
+                        const char *mac_str, const char *ip_str,
+                        const char *name, const char *reason) {
+    char iso[48];
+    ts_iso8601(ts_secs, iso, sizeof(iso));
+    json_out_t j;
+    json_out_init(&j);
+    json_obj_begin(&j);
+    json_kstr(&j, "ts",     iso);
+    json_kstr(&j, "kind",   "lease");
+    json_kstr(&j, "action", action);
+    if (mac_str && *mac_str) json_kstr(&j, "mac", mac_str);
+    if (ip_str  && *ip_str)  json_kstr(&j, "ip",  ip_str);
+    if (name    && *name)    json_kstr(&j, "name", name);
+    if (reason  && *reason)  json_kstr(&j, "reason", reason);
+    json_obj_end(&j);
+    if (jl && j.buf) jsonl_append(jl, j.buf, j.len);
+    json_out_free(&j);
+}
+
 /* ---------------------------- flush --------------------------------- */
 
 void metrics_flush(wg_metrics_t *m,

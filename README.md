@@ -49,8 +49,9 @@ State lives under `/opt/wgatectl/`:
 | `schedule.json`   | weekly base transitions + pending one-shot overrides |
 | `filterd.json`    | domain suffixes whose A-record IPs are dropped in `filtered` mode |
 | `pins.json`       | per-host fixed-mode pins (mode + expiry)          |
+| `hosts.json`      | per-MAC `first_seen`/`last_seen` (epoch seconds) for the `/hosts` timestamps; survives restarts |
 
-Alongside the JSONL event files and the Unix socket.  All three JSON
+Alongside the JSONL event files and the Unix socket.  All four JSON
 files are optional at startup — missing files are treated as empty (or,
 for `schedule.json`, the hard-coded defaults).
 
@@ -136,7 +137,7 @@ Routes:
 | Method | Path                              | Purpose                                                 |
 |--------|-----------------------------------|---------------------------------------------------------|
 | GET    | `/status`                         | liveness, counters, current mode, next transition       |
-| GET    | `/hosts`                          | every lease; pinned entries carry `pinned: true` and `pin_mode` |
+| GET    | `/hosts`                          | every lease; entries carry `first_seen_unix` / `last_seen_unix` when the MAC is known; pinned entries carry `pinned: true` and `pin_mode` |
 | POST   | `/hosts/{ip\|name}/mode`           | pin this host to a fixed mode for a time window — JSON body `{mode, minutes\|until, reason}` |
 | DELETE | `/hosts/{ip\|name}/mode`           | remove the active pin                                   |
 | POST   | `/hosts/{ip\|name\|mac}/name?name=<new>` | set the DHCP-reservation name for this device — rewrites `dnsmasq.conf` + debounced reload |
@@ -159,7 +160,7 @@ body (`content-type: application/json`).
 ## JSONL events
 
 Written to `/opt/wgatectl/events-YYYYMMDD.jsonl`, one JSON object per
-line.  `kind` is `traffic`, `system`, or `control`.
+line.  `kind` is `traffic`, `system`, `control`, or `lease`.
 
 ```json
 {"ts":"2026-04-20T15:43:00-07:00","kind":"traffic","ip":"10.6.6.161",
@@ -177,12 +178,24 @@ line.  `kind` is `traffic`, `system`, or `control`.
 
 {"ts":"...","kind":"control","action":"closed",
  "name":"dhcp-range","reason":"schedule"}
+
+{"ts":"...","kind":"lease","action":"add","mac":"aa:bb:cc:dd:ee:01",
+ "ip":"10.6.6.5","name":"ipad"}
+
+{"ts":"...","kind":"lease","action":"remove","mac":"aa:bb:cc:dd:ee:01",
+ "ip":"10.6.6.5","name":"ipad","reason":"expired"}
 ```
 
 For `control` events `action` is `pin` / `unpin` for per-host mode pins,
 or one of `closed` / `filtered` / `open` for global mode transitions
 (then `name="dhcp-range"`). `reason` is `api` for socket calls,
 `schedule` for mode-transition edges, or the chosen mode name for pins.
+
+For `kind=lease`, `action` is `add` (a MAC just appeared in
+`dnsmasq.leases`) or `remove`. On `remove`, optional `reason` is
+`replaced` if a different MAC now holds the same IP, else `expired`.
+The events fire whenever `dnsmasq.leases` changes on disk
+(mtime-driven, no polling).
 
 Domain labelling comes solely from sniffed DNS responses; unresolved
 server IPs appear as their dotted-quad string.  The top 64 domains per

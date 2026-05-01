@@ -33,6 +33,7 @@ static void defaults(wg_cfg_t *c) {
     set_str(c->filterd_json,   sizeof(c->filterd_json),   "/opt/wgatectl/filterd.json");
     set_str(c->pins_json,      sizeof(c->pins_json),      "/opt/wgatectl/pins.json");
     set_str(c->supervised_json,sizeof(c->supervised_json),"/opt/wgatectl/supervised.json");
+    set_str(c->hosts_db_json,  sizeof(c->hosts_db_json),  "/opt/wgatectl/hosts.json");
     set_str(c->jsonl_dir,      sizeof(c->jsonl_dir),      "/opt/wgatectl");
     c->jsonl_retain_days = 14;
     set_str(c->sock_path,      sizeof(c->sock_path),      "/opt/wgatectl/wgatectl.sock");
@@ -55,6 +56,7 @@ static void apply_kv(wg_cfg_t *c, const char *k, const char *v) {
     else if (!strcmp(k, "WG_FILTERD_JSON"))    set_str(c->filterd_json,   sizeof(c->filterd_json),   v);
     else if (!strcmp(k, "WG_PINS_JSON"))       set_str(c->pins_json,      sizeof(c->pins_json),      v);
     else if (!strcmp(k, "WG_SUPERVISED_JSON")) set_str(c->supervised_json,sizeof(c->supervised_json),v);
+    else if (!strcmp(k, "WG_HOSTS_DB_JSON"))   set_str(c->hosts_db_json,  sizeof(c->hosts_db_json),  v);
     else if (!strcmp(k, "WG_JSONL_DIR"))       set_str(c->jsonl_dir,      sizeof(c->jsonl_dir),      v);
     else if (!strcmp(k, "WG_JSONL_RETAIN"))    set_int(&c->jsonl_retain_days, v);
     else if (!strcmp(k, "WG_SOCK"))            set_str(c->sock_path,      sizeof(c->sock_path),      v);
@@ -106,6 +108,7 @@ static void load_env(wg_cfg_t *c) {
         "WG_DNSMASQ_CONF", "WG_DNSMASQ_LEASES",
         "WG_SCHEDULE_JSON", "WG_FILTERD_JSON", "WG_PINS_JSON",
         "WG_SUPERVISED_JSON",
+        "WG_HOSTS_DB_JSON",
         "WG_JSONL_DIR", "WG_JSONL_RETAIN",
         "WG_SOCK", "WG_SOCK_GROUP",
         "WG_IPTABLES_BIN", "WG_IPSET_BIN", "WG_IP_BIN", "WG_STATIC_CIDR",

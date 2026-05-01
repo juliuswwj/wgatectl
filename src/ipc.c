@@ -303,6 +303,8 @@ static void handle_hosts(wg_ipc_t *ipc, client_t *c) {
         json_kbool(&j, "is_static", l->is_static);
         json_kbool(&j, "pinned", pinned);
         if (pinned) json_kstr(&j, "pin_mode", sch_mode_name(pmode));
+        if (l->first_seen) json_ki64(&j, "first_seen_unix", l->first_seen);
+        if (l->last_seen)  json_ki64(&j, "last_seen_unix",  l->last_seen);
         json_obj_end(&j);
     }
     json_arr_end(&j);
